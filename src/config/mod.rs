@@ -23,6 +23,8 @@ pub struct Config {
     pub backends: BTreeMap<String, Backend>,
     #[serde(default)]
     pub timeouts: Timeouts,
+    #[serde(default)]
+    pub limits: Limits,
 }
 
 /// A listener only decides how client connections are accepted (`bind`, `proto`).
@@ -144,6 +146,24 @@ pub struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Self { handshake: 5, connect: 10, idle: 300 }
+    }
+}
+
+/// Resource limits. Bound memory per pending connection independently of the
+/// handshake timeout (a slow client shouldn't be able to buffer unbounded data
+/// before we've even routed it).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Limits {
+    /// Max bytes buffered while reassembling a TLS ClientHello.
+    pub max_client_hello: usize,
+    /// Max concurrent connections per client IP (0 = unlimited).
+    pub max_conns_per_ip: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { max_client_hello: 16 * 1024, max_conns_per_ip: 0 }
     }
 }
 

@@ -12,6 +12,13 @@ serde = { version = "1", features = ["derive"] }
 # maintained drop-in fork of the archived serde_yaml (RUSTSEC-2024-0320)
 serde_norway = "0.9"
 
+# QUIC Initial decryption (RFC 9001 key schedule). Pure-Rust RustCrypto crates,
+# no C toolchain needed on the build server.
+hkdf = "0.12"
+sha2 = "0.10"
+aes = "0.8"
+aes-gcm = "0.10"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

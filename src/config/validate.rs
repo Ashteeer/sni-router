@@ -223,6 +223,19 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         }
     }
 
+    // Limits.
+    if cfg.limits.max_client_hello < 512 {
+        d.push(Diagnostic::error(
+            "limits.max_client_hello",
+            "must be at least 512 bytes (a real ClientHello does not fit in less)",
+        ));
+    } else if cfg.limits.max_client_hello > 1 << 20 {
+        d.push(Diagnostic::warning(
+            "limits.max_client_hello",
+            "larger than 1 MiB — a ClientHello is normally a few KiB",
+        ));
+    }
+
     d
 }
 

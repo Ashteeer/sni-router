@@ -1,4 +1,6 @@
 mod config;
+mod protocol;
+mod router;
 
 use config::validate::{Diagnostic, Level};
 use std::io::IsTerminal;
