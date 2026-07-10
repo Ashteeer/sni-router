@@ -1,0 +1,51 @@
+# sni-router example configuration.
+# Copy to /etc/sni-router/sni-router.yaml and adjust.
+# Validate any time (never binds ports, safe next to a live instance):
+#   sni-router -t
+
+listeners:
+  - name: main_tls
+    bind:                       # one listener can accept on several addresses
+      - "0.0.0.0:443"
+      - "[::]:443"
+    proto: tcp                  # tcp | udp (udp = QUIC passthrough)
+    routes:                     # first match wins
+      - sni: "example.com"
+        backend: web_main
+      - sni: "*.example.com"    # any subdomain depth, NOT example.com itself
+        backend: web_main
+      - sni: "*"                # catch-all (also catches clients without SNI)
+        backend: default_pool
+
+backends:
+  web_main:
+    mode: passthrough           # passthrough | terminate — what THIS backend expects
+    proxy_protocol: v2          # none | v1 | v2 — how to pass the real client IP
+    balance: round_robin        # round_robin | least_conn
+    health_check: true          # TCP connect probe (default: false)
+    servers:
+      - "10.0.0.1:443"
+      - "10.0.0.2:443"
+
+  default_pool:                 # minimal backend: everything defaulted
+    servers:
+      - "10.0.0.9:443"
+
+  # TLS termination example (post-MVP feature, config schema is ready):
+  # api_terminate:
+  #   mode: terminate
+  #   tls:
+  #     cert: "/etc/sni-router/certs/api.example.org.pem"
+  #     key: "/etc/sni-router/certs/api.example.org.key"
+  #   headers:
+  #     x_real_ip: true
+  #     x_forwarded_proto: true
+  #   balance: least_conn
+  #   servers:
+  #     - "10.0.1.5:8080"
+
+# Global timeouts, seconds (defaults shown).
+timeouts:
+  handshake: 5                  # max time to read ClientHello (slowloris protection)
+  connect: 10                   # backend connect timeout
+  idle: 300                     # idle connection timeout

@@ -1,0 +1,20 @@
+[package]
+name = "sni-router"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance SNI-based L4 router: TCP/UDP/QUIC passthrough without TLS termination"
+license = "Apache-2.0"
+repository = "https://github.com/Ashteeer/sni-router"
+readme = "README.md"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# maintained drop-in fork of the archived serde_yaml (RUSTSEC-2024-0320)
+serde_norway = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
