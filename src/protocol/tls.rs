@@ -65,6 +65,11 @@ fn reassemble_handshake(buf: &[u8], max: usize) -> Reassembly {
     loop {
         // Do we already hold a complete handshake message?
         if let Some(total) = handshake_total_len(&hs) {
+            // A ClientHello that *declares* itself larger than our cap is
+            // rejected up front — no point buffering toward a size we'd refuse.
+            if total > max {
+                return Reassembly::NotHandshake;
+            }
             if hs.len() >= total {
                 hs.truncate(total);
                 return Reassembly::Complete(hs);

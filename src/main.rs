@@ -1,6 +1,8 @@
+mod backend;
 mod config;
 mod protocol;
 mod router;
+mod server;
 
 use config::validate::{Diagnostic, Level};
 use std::io::IsTerminal;
@@ -109,8 +111,13 @@ fn main() -> ExitCode {
         eprintln!("refusing to start with an invalid configuration");
         return ExitCode::FAILURE;
     }
-    eprintln!("run mode is not implemented yet — this build only supports --test-config / -t");
-    ExitCode::from(2)
+    match server::run(cfg) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn test_config(path: &Path, check_backends: bool, color: bool) -> ExitCode {
