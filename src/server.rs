@@ -37,6 +37,10 @@ const UDP_SWEEP_EVERY: u32 = 512;
 pub struct Shared {
     pub cfg: Config,
     pub pools: HashMap<String, Pool>,
+    /// Compiled ACL per listener (indexed like `cfg.listeners`); `None` = no ACL.
+    pub acls: Vec<Option<crate::acl::Acl>>,
+    /// TLS contexts for terminate backends, keyed by backend name.
+    pub terminate: HashMap<String, crate::terminate::TerminateCtx>,
 }
 
 /// Run the router until killed. Blocks the calling thread.
@@ -47,7 +51,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
             pools.insert(name.clone(), p);
         }
     }
-    let shared = Arc::new(Shared { cfg, pools });
+    let acls = cfg
+        .listeners
+        .iter()
+        .map(|l| l.acl.as_ref().and_then(|a| crate::acl::Acl::compile(a).ok()))
+        .collect();
+    let terminate = crate::terminate::TerminateCtx::build_all(&cfg.backends);
+    let shared = Arc::new(Shared { cfg, pools, acls, terminate });
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     eprintln!(
@@ -154,6 +164,15 @@ async fn handle_tcp(
     shared: Arc<Shared>,
 ) -> io::Result<()> {
     let cfg = &shared.cfg;
+    let acl = shared.acls[listener_idx].as_ref();
+
+    // IP ACL: reject before we spend any effort reading the handshake.
+    if let Some(acl) = acl {
+        if !acl.ip_allowed(peer.ip()) {
+            return Ok(());
+        }
+    }
+
     let max = cfg.limits.max_client_hello;
     let hs_timeout = Duration::from_secs(cfg.timeouts.handshake);
 
@@ -182,6 +201,13 @@ async fn handle_tcp(
         }
     };
 
+    // SNI ACL: now that we know the server name, enforce the name-based rules.
+    if let Some(acl) = acl {
+        if !acl.sni_allowed(&sni) {
+            return Ok(());
+        }
+    }
+
     let routes = &cfg.listeners[listener_idx].routes;
     let backend_name = match router::pick(routes, &sni) {
         Some(b) => b,
@@ -191,15 +217,16 @@ async fn handle_tcp(
         Some(p) => p,
         None => return Ok(()),
     };
-    if pool.mode == Mode::Terminate {
-        // TLS termination is post-MVP; don't silently mis-route.
-        eprintln!("backend {backend_name}: terminate mode not implemented, dropping {peer}");
-        return Ok(());
-    }
-
     let idx = pool.pick();
     let _guard = ConnGuard::new(pool, idx);
     let addr = pool.addr(idx);
+
+    if pool.mode == Mode::Terminate {
+        return match shared.terminate.get(backend_name) {
+            Some(ctx) => crate::terminate::handle(buf, client, peer, &sni, addr, ctx).await,
+            None => Ok(()), // TLS context failed to build at startup — drop
+        };
+    }
 
     let connect_timeout = Duration::from_secs(cfg.timeouts.connect);
     let mut upstream = match monoio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
@@ -313,6 +340,11 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
         }
 
         // New flow.
+        if let Some(acl) = shared.acls[listener_idx].as_ref() {
+            if !acl.ip_allowed(peer.ip()) {
+                continue; // IP not permitted on this listener
+            }
+        }
         if flows.len() >= MAX_UDP_FLOWS {
             continue; // shed load rather than grow unbounded
         }
@@ -363,6 +395,14 @@ async fn route_udp(
     shared: &Arc<Shared>,
     sock: &Rc<UdpSocket>,
 ) {
+    // SNI ACL for the QUIC listener.
+    if let Some(acl) = shared.acls[listener_idx].as_ref() {
+        if !acl.sni_allowed(&sni) {
+            flows.remove(&peer);
+            return;
+        }
+    }
+
     let routes = &shared.cfg.listeners[listener_idx].routes;
     let decision = router::pick(routes, &sni)
         .and_then(|name| shared.pools.get(name))

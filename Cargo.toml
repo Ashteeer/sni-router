@@ -23,6 +23,14 @@ aes-gcm = "0.10"
 monoio = "0.2"
 socket2 = "0.5"
 
+# TLS termination (mode: terminate). rustls with the `ring` provider — builds
+# with cc+perl, no cmake/nasm needed on the build server.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+monoio-rustls = "0.4"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+httparse = "1"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 

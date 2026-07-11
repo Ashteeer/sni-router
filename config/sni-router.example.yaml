@@ -9,6 +9,12 @@ listeners:
       - "0.0.0.0:443"
       - "[::]:443"
     proto: tcp                  # tcp | udp (udp = QUIC passthrough)
+    # Optional access control (deny wins; an empty allow list means "any").
+    # acl:
+    #   allow_ip: ["10.0.0.0/8", "192.168.1.5"]
+    #   deny_ip:  ["10.0.0.66"]
+    #   allow_sni: ["*.example.com"]
+    #   deny_sni:  ["blocked.example.com"]
     routes:                     # first match wins
       - sni: "example.com"
         backend: web_main
@@ -31,14 +37,21 @@ backends:
     servers:
       - "10.0.0.9:443"
 
-  # TLS termination example (post-MVP feature, config schema is ready):
+  # TLS termination example (mode: terminate — TCP/HTTP only):
   # api_terminate:
   #   mode: terminate
-  #   tls:
+  #   tls:                              # cert the router presents to clients
   #     cert: "/etc/sni-router/certs/api.example.org.pem"
   #     key: "/etc/sni-router/certs/api.example.org.key"
+  #   backend_tls:                      # optional: re-encrypt to the backend
+  #     sni: "api.internal"             #   name to send/verify (default: client SNI)
+  #     ca: "/etc/sni-router/certs/backend-ca.pem"   # trust this CA (default: system roots)
+  #     # insecure_skip_verify: true    #   skip verification (test only)
+  #     # client_cert: "/etc/.../client.pem"   # mTLS to the backend
+  #     # client_key:  "/etc/.../client.key"
   #   headers:
   #     x_real_ip: true
+  #     x_forwarded_for: true
   #     x_forwarded_proto: true
   #   balance: least_conn
   #   servers:

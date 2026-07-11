@@ -1,8 +1,10 @@
+mod acl;
 mod backend;
 mod config;
 mod protocol;
 mod router;
 mod server;
+mod terminate;
 
 use config::validate::{Diagnostic, Level};
 use std::io::IsTerminal;

@@ -35,6 +35,37 @@ const INITIAL_SALT_V1: [u8; 20] = [
 ];
 const VERSION_V1: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 
+/// RFC 9369 §3.3.1 initial salt for QUIC v2.
+const INITIAL_SALT_V2: [u8; 20] = [
+    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
+    0xf9, 0xbd, 0x2e, 0xd9,
+];
+const VERSION_V2: [u8; 4] = [0x6b, 0x33, 0x43, 0xcf];
+
+/// QUIC version we can decrypt Initial packets for. v1 and v2 differ in salt,
+/// the HKDF key/iv/hp labels, and the long-header Initial type nibble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ver {
+    V1,
+    V2,
+}
+
+impl Ver {
+    fn salt(self) -> &'static [u8] {
+        match self {
+            Ver::V1 => &INITIAL_SALT_V1,
+            Ver::V2 => &INITIAL_SALT_V2,
+        }
+    }
+    /// (key, iv, hp) HKDF-Expand-Label labels.
+    fn labels(self) -> (&'static [u8], &'static [u8], &'static [u8]) {
+        match self {
+            Ver::V1 => (b"quic key", b"quic iv", b"quic hp"),
+            Ver::V2 => (b"quicv2 key", b"quicv2 iv", b"quicv2 hp"),
+        }
+    }
+}
+
 /// Cap on reassembled CRYPTO bytes per flow — bounds memory when a hostile
 /// client streams many small/overlapping fragments.
 pub const MAX_CRYPTO: usize = 64 * 1024;
@@ -55,13 +86,13 @@ pub enum Scan {
 /// Scan a UDP datagram, decrypting every leading coalesced Initial packet and
 /// returning all CRYPTO fragments found.
 pub fn scan(datagram: &[u8]) -> Scan {
-    if !looks_like_initial_v1(datagram) {
+    if detect_initial(datagram).is_none() {
         return Scan::NotInitial;
     }
     let mut frags = Vec::new();
     let mut off = 0;
-    while looks_like_initial_v1(&datagram[off..]) {
-        match decrypt_one(&datagram[off..]) {
+    while let Some(ver) = detect_initial(&datagram[off..]) {
+        match decrypt_one(&datagram[off..], ver) {
             Ok((mut f, consumed)) => {
                 frags.append(&mut f);
                 if consumed == 0 {
@@ -81,8 +112,21 @@ pub fn scan(datagram: &[u8]) -> Scan {
     Scan::Crypto(frags)
 }
 
-fn looks_like_initial_v1(pkt: &[u8]) -> bool {
-    pkt.len() >= 5 && (pkt[0] & 0xF0) == 0xC0 && pkt[1..5] == VERSION_V1
+/// Is `pkt` a QUIC v1 or v2 Initial (long header, matching version + Initial
+/// type nibble)? The type nibble differs: v1 Initial is `0xC0`, v2 is `0xD0`.
+fn detect_initial(pkt: &[u8]) -> Option<Ver> {
+    if pkt.len() < 5 {
+        return None;
+    }
+    let ver = &pkt[1..5];
+    let nibble = pkt[0] & 0xF0;
+    if ver == VERSION_V1 && nibble == 0xC0 {
+        Some(Ver::V1)
+    } else if ver == VERSION_V2 && nibble == 0xD0 {
+        Some(Ver::V2)
+    } else {
+        None
+    }
 }
 
 enum DecErr {
@@ -92,10 +136,10 @@ enum DecErr {
 
 /// Decrypt one Initial packet at the front of `pkt`. Returns the CRYPTO
 /// fragments and how many bytes this packet consumed (for coalesced parsing).
-fn decrypt_one(pkt: &[u8]) -> Result<(Vec<(u64, Vec<u8>)>, usize), DecErr> {
+fn decrypt_one(pkt: &[u8], ver: Ver) -> Result<(Vec<(u64, Vec<u8>)>, usize), DecErr> {
     let mut c = Cur::new(pkt);
     let byte0 = c.u8().ok_or(DecErr::Truncated)?;
-    c.take(4).ok_or(DecErr::Truncated)?; // version (already checked v1)
+    c.take(4).ok_or(DecErr::Truncated)?; // version (already checked)
     let dcid_len = c.u8().ok_or(DecErr::Truncated)? as usize;
     if dcid_len > 20 {
         return Err(DecErr::Undecryptable);
@@ -121,7 +165,7 @@ fn decrypt_one(pkt: &[u8]) -> Result<(Vec<(u64, Vec<u8>)>, usize), DecErr> {
         return Err(DecErr::Truncated);
     }
 
-    let keys = Keys::derive(&dcid);
+    let keys = Keys::derive(&dcid, ver);
 
     // Remove header protection.
     let sample = &pkt[sample_offset..sample_offset + 16];
@@ -211,12 +255,13 @@ struct Keys {
 }
 
 impl Keys {
-    fn derive(dcid: &[u8]) -> Self {
-        let (initial_secret, _) = Hkdf::<Sha256>::extract(Some(&INITIAL_SALT_V1), dcid);
+    fn derive(dcid: &[u8], ver: Ver) -> Self {
+        let (initial_secret, _) = Hkdf::<Sha256>::extract(Some(ver.salt()), dcid);
         let cis = hkdf_expand_label(&initial_secret, b"client in", 32);
-        let key = hkdf_expand_label(&cis, b"quic key", 16);
-        let iv = hkdf_expand_label(&cis, b"quic iv", 12);
-        let hp = hkdf_expand_label(&cis, b"quic hp", 16);
+        let (kl, il, hl) = ver.labels();
+        let key = hkdf_expand_label(&cis, kl, 16);
+        let iv = hkdf_expand_label(&cis, il, 12);
+        let hp = hkdf_expand_label(&cis, hl, 16);
         let mut k = Keys { key: [0; 16], iv: [0; 12], hp: [0; 16] };
         k.key.copy_from_slice(&key);
         k.iv.copy_from_slice(&iv);
@@ -379,39 +424,56 @@ mod tests {
 
     #[test]
     fn key_schedule_matches_rfc9001() {
-        let keys = Keys::derive(&RFC_DCID);
+        let keys = Keys::derive(&RFC_DCID, Ver::V1);
         assert_eq!(keys.key.to_vec(), hex("1f369613dd76d5467730efcbe3b1a22d"));
         assert_eq!(keys.iv.to_vec(), hex("fa044b2f42a3fd3b46fb255c"));
         assert_eq!(keys.hp.to_vec(), hex("9f50449e04a0e810283a1e9933adedd2"));
     }
 
     #[test]
+    fn key_schedule_matches_rfc9369_v2() {
+        // RFC 9369 Appendix A.1, same DCID.
+        let keys = Keys::derive(&RFC_DCID, Ver::V2);
+        assert_eq!(keys.key.to_vec(), hex("8b1a0bc121284290a29e0971b5cd045d"));
+        assert_eq!(keys.iv.to_vec(), hex("91f73e2351d8fa91660e909f"));
+        assert_eq!(keys.hp.to_vec(), hex("45b95e15235d6f45a6b19cbcb0294ba9"));
+    }
+
+    #[test]
     fn header_protection_mask_matches_rfc9001() {
-        let keys = Keys::derive(&RFC_DCID);
+        let keys = Keys::derive(&RFC_DCID, Ver::V1);
         let sample = hex("d1b1c98dd7689fb8ec11d242b123dc9b");
         assert_eq!(keys.hp_mask(&sample).unwrap().to_vec(), hex("437b9aec36"));
     }
 
-    /// Build a QUIC v1 Initial carrying `frames` as its payload, sealed with the
-    /// same key schedule the parser uses (inverse of `decrypt_one`).
-    fn seal_initial(dcid: &[u8], pn: u64, mut frames: Vec<u8>) -> Vec<u8> {
+    /// Build a QUIC Initial (v1 or v2) carrying `frames` as its payload, sealed
+    /// with the same key schedule the parser uses (inverse of `decrypt_one`).
+    fn seal_initial(dcid: &[u8], pn: u64, frames: Vec<u8>) -> Vec<u8> {
+        seal_initial_ver(dcid, pn, frames, Ver::V1)
+    }
+
+    fn seal_initial_ver(dcid: &[u8], pn: u64, mut frames: Vec<u8>, ver: Ver) -> Vec<u8> {
         let pn_len = 4usize;
         // Ensure the payload is long enough for a 16-byte header-protection
         // sample taken 4 bytes past the packet number.
         while frames.len() < 4 + 16 {
             frames.push(0); // PADDING
         }
-        let keys = Keys::derive(dcid);
+        let keys = Keys::derive(dcid, ver);
 
         let mut nonce = keys.iv;
         for (i, b) in pn.to_be_bytes().iter().enumerate() {
             nonce[4 + i] ^= b;
         }
 
+        let (type_nibble, version): (u8, [u8; 4]) = match ver {
+            Ver::V1 => (0xC0, VERSION_V1),
+            Ver::V2 => (0xD0, VERSION_V2),
+        };
         // Unprotected header.
         let mut hdr = Vec::new();
-        hdr.push(0xC0 | (pn_len as u8 - 1)); // long + fixed + Initial + pn_len
-        hdr.extend_from_slice(&VERSION_V1);
+        hdr.push(type_nibble | (pn_len as u8 - 1)); // long + fixed + Initial + pn_len
+        hdr.extend_from_slice(&version);
         hdr.push(dcid.len() as u8);
         hdr.extend_from_slice(dcid);
         hdr.push(0); // scid len
@@ -454,6 +516,13 @@ mod tests {
         let ch = client_hello(Some("quic.example.com"));
         let pkt = seal_initial(&RFC_DCID, 1, crypto_frame(0, &ch));
         assert_eq!(sni_of(&pkt), Sni::Found("quic.example.com".into()));
+    }
+
+    #[test]
+    fn roundtrip_v2() {
+        let ch = client_hello(Some("v2.example.com"));
+        let pkt = seal_initial_ver(&RFC_DCID, 1, crypto_frame(0, &ch), Ver::V2);
+        assert_eq!(sni_of(&pkt), Sni::Found("v2.example.com".into()));
     }
 
     #[test]

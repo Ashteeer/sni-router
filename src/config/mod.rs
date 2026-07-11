@@ -38,8 +38,27 @@ pub struct Listener {
     pub bind: Vec<String>,
     #[serde(default)]
     pub proto: Proto,
+    /// Optional access control for this listener (by client IP and/or SNI).
+    #[serde(default)]
+    pub acl: Option<AclConfig>,
     /// First match wins.
     pub routes: Vec<Route>,
+}
+
+/// Raw access-control lists (strings); compiled into [`crate::acl::Acl`] at
+/// startup. An empty allow list means "allow all" for that dimension; deny
+/// always wins.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AclConfig {
+    /// Client IPs/CIDRs permitted (empty = any).
+    pub allow_ip: Vec<String>,
+    /// Client IPs/CIDRs rejected.
+    pub deny_ip: Vec<String>,
+    /// SNI patterns permitted (empty = any); same wildcard rules as routes.
+    pub allow_sni: Vec<String>,
+    /// SNI patterns rejected.
+    pub deny_sni: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -72,8 +91,13 @@ pub struct Backend {
     pub balance: Balance,
     #[serde(default)]
     pub health_check: bool,
-    /// Required (and only used) when `mode: terminate`.
+    /// Required (and only used) when `mode: terminate`: the cert/key the router
+    /// presents to clients for server names routed to this backend.
     pub tls: Option<Tls>,
+    /// When set (terminate mode only), the router re-encrypts to the backend
+    /// over TLS instead of forwarding plaintext. Absent = plaintext to backend.
+    #[serde(default)]
+    pub backend_tls: Option<BackendTls>,
     /// Injected HTTP headers; only applied when `mode: terminate`.
     #[serde(default)]
     pub headers: Headers,
@@ -114,7 +138,23 @@ pub struct Tls {
     pub key: PathBuf,
 }
 
+/// Backend-side TLS for terminate mode (re-encrypt, optional mTLS).
 #[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BackendTls {
+    /// ServerName sent (and verified) to the backend. Defaults to the client's
+    /// requested SNI if unset.
+    pub sni: Option<String>,
+    /// Skip backend certificate verification (dangerous; test/self-signed only).
+    pub insecure_skip_verify: bool,
+    /// Trust this CA (PEM) for the backend cert instead of the built-in roots.
+    pub ca: Option<PathBuf>,
+    /// mTLS: client certificate the router presents to the backend.
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Headers {
     #[serde(default)]

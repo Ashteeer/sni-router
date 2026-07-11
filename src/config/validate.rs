@@ -97,6 +97,18 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                 "listener has no routes — every connection will be dropped",
             ));
         }
+        if let Some(acl) = &l.acl {
+            for (field, list) in [("allow_ip", &acl.allow_ip), ("deny_ip", &acl.deny_ip)] {
+                for (k, entry) in list.iter().enumerate() {
+                    if let Err(e) = crate::acl::Cidr::parse(entry) {
+                        d.push(Diagnostic::error(
+                            format!("listeners[{i}].acl.{field}[{k}]"),
+                            e,
+                        ));
+                    }
+                }
+            }
+        }
         for (r, route) in l.routes.iter().enumerate() {
             let rp = format!("listeners[{i}].routes[{r}]");
             if route.sni.is_empty() {
@@ -166,27 +178,57 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
             }
         }
         match b.mode {
-            Mode::Terminate => match &b.tls {
-                None => d.push(Diagnostic::error(
-                    format!("{bp}.tls"),
-                    "mode \"terminate\" requires a tls section with cert and key",
-                )),
-                Some(t) => {
-                    for (field, p) in [("cert", &t.cert), ("key", &t.key)] {
-                        if let Err(e) = std::fs::File::open(p) {
-                            d.push(Diagnostic::error(
-                                format!("{bp}.tls.{field}"),
-                                format!("cannot read \"{}\": {e}", p.display()),
-                            ));
+            Mode::Terminate => {
+                match &b.tls {
+                    None => d.push(Diagnostic::error(
+                        format!("{bp}.tls"),
+                        "mode \"terminate\" requires a tls section with cert and key",
+                    )),
+                    Some(t) => {
+                        for (field, p) in [("cert", &t.cert), ("key", &t.key)] {
+                            if let Err(e) = std::fs::File::open(p) {
+                                d.push(Diagnostic::error(
+                                    format!("{bp}.tls.{field}"),
+                                    format!("cannot read \"{}\": {e}", p.display()),
+                                ));
+                            }
                         }
                     }
                 }
-            },
+                if let Some(bt) = &b.backend_tls {
+                    for (field, p) in [
+                        ("ca", &bt.ca),
+                        ("client_cert", &bt.client_cert),
+                        ("client_key", &bt.client_key),
+                    ] {
+                        if let Some(path) = p {
+                            if let Err(e) = std::fs::File::open(path) {
+                                d.push(Diagnostic::error(
+                                    format!("{bp}.backend_tls.{field}"),
+                                    format!("cannot read \"{}\": {e}", path.display()),
+                                ));
+                            }
+                        }
+                    }
+                    if bt.client_cert.is_some() != bt.client_key.is_some() {
+                        d.push(Diagnostic::error(
+                            format!("{bp}.backend_tls"),
+                            "mTLS requires both client_cert and client_key (or neither)",
+                        ));
+                    }
+                }
+            }
             Mode::Passthrough => {
                 if b.tls.is_some() {
                     d.push(Diagnostic::warning(
                         format!("{bp}.tls"),
                         "tls section is ignored in passthrough mode",
+                    ));
+                }
+                if b.backend_tls.is_some() {
+                    d.push(Diagnostic::warning(
+                        format!("{bp}.backend_tls"),
+                        "backend_tls is ignored in passthrough mode",
                     ));
                 }
                 if b.headers.any() {

@@ -102,6 +102,7 @@ mod tests {
             balance,
             health_check: false,
             tls: None,
+            backend_tls: None,
             headers: Default::default(),
             servers: servers.iter().map(|s| s.to_string()).collect(),
         }
