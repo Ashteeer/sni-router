@@ -20,7 +20,8 @@ aes = "0.8"
 aes-gcm = "0.10"
 
 # Runtime: io_uring thread-per-core, plus raw socket setup for SO_REUSEPORT.
-monoio = "0.2"
+# `splice` enables kernel zero-copy forwarding (monoio::io::zero_copy).
+monoio = { version = "0.2", features = ["splice"] }
 socket2 = "0.5"
 
 # TLS termination (mode: terminate). rustls with the `ring` provider — builds
@@ -35,6 +36,10 @@ arc-swap = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# SIGHUP graceful reload.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
 
 [profile.release]
 opt-level = 3

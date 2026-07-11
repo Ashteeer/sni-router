@@ -4,18 +4,24 @@
 //! Sharding is `SO_REUSEPORT` + thread-per-core: one runtime per core, each
 //! with its own accept sockets bound to the same addresses. The kernel spreads
 //! connections (and UDP 4-tuples) across the reuseport group, so no work
-//! stealing and no cross-core locking on the hot path. Forwarding is a buffered
-//! bidirectional copy.
-//! ponytail: buffered copy, not `splice()` zero-copy yet — correct first; the
-//! splice upgrade (io_uring `IORING_OP_SPLICE` via a pipe pair) is a drop-in
-//! replacement for `copy_half` when throughput demands it.
+//! stealing and no cross-core locking on the hot path. TCP passthrough uses
+//! kernel **zero-copy splice** (`monoio::io::zero_copy`) — data never enters
+//! user space.
+//!
+//! Reloadable state (routes/backends/ACLs/timeouts) lives behind an `ArcSwap`;
+//! SIGHUP rebuilds it and swaps atomically, so live connections keep the state
+//! they started with and new ones pick up the change without a restart.
 
+use crate::acl::Acl;
 use crate::backend::{ConnGuard, Pool};
+use crate::config::validate::Level;
 use crate::config::{Config, Mode, Proto, ProxyProtocol};
 use crate::protocol::{proxy_protocol, quic, tls};
 use crate::router;
 
+use arc_swap::ArcSwap;
 use monoio::buf::IoBuf;
+use monoio::io::as_fd::{AsReadFd, AsWriteFd};
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::udp::UdpSocket;
 use monoio::net::{TcpListener, TcpStream};
@@ -24,29 +30,34 @@ use socket2::{Domain, Protocol as SockProto, Socket, Type};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const UDP_DGRAM_MAX: usize = 2048;
-const COPY_BUF: usize = 32 * 1024;
 const MAX_UDP_FLOWS: usize = 100_000;
 const UDP_SWEEP_EVERY: u32 = 512;
 
-/// Immutable-ish state shared across all worker threads.
-pub struct Shared {
+/// State that can be swapped atomically on SIGHUP reload.
+pub struct State {
     pub cfg: Config,
     pub pools: HashMap<String, Pool>,
     /// Compiled ACL per listener (indexed like `cfg.listeners`); `None` = no ACL.
-    pub acls: Vec<Option<crate::acl::Acl>>,
-    /// TLS contexts for terminate backends, keyed by backend name.
-    pub terminate: HashMap<String, crate::terminate::TerminateCtx>,
-    /// Process start time, for the admin API's uptime.
-    pub started: Instant,
+    pub acls: Vec<Option<Acl>>,
 }
 
-/// Run the router until killed. Blocks the calling thread.
-pub fn run(cfg: Config) -> io::Result<()> {
+/// Process-wide shared handle.
+pub struct Shared {
+    pub state: ArcSwap<State>,
+    /// TLS contexts for terminate backends (built once; certs hot-reload via the
+    /// cert watcher, not via SIGHUP).
+    pub terminate: HashMap<String, crate::terminate::TerminateCtx>,
+    pub started: Instant,
+    config_path: PathBuf,
+}
+
+fn build_state(cfg: Config) -> State {
     let mut pools = HashMap::new();
     for (name, b) in &cfg.backends {
         if let Some(p) = Pool::from_backend(b) {
@@ -56,16 +67,30 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let acls = cfg
         .listeners
         .iter()
-        .map(|l| l.acl.as_ref().and_then(|a| crate::acl::Acl::compile(a).ok()))
+        .map(|l| l.acl.as_ref().and_then(|a| Acl::compile(a).ok()))
         .collect();
+    State { cfg, pools, acls }
+}
+
+/// Run the router until killed. Blocks the calling thread.
+pub fn run(cfg: Config, config_path: PathBuf) -> io::Result<()> {
     let (terminate, cert_watch) = crate::terminate::TerminateCtx::build_all(&cfg.backends);
     crate::terminate::spawn_cert_watcher(cert_watch);
-    let shared = Arc::new(Shared { cfg, pools, acls, terminate, started: Instant::now() });
+
+    let shared = Arc::new(Shared {
+        state: ArcSwap::new(Arc::new(build_state(cfg))),
+        terminate,
+        started: Instant::now(),
+        config_path,
+    });
+
+    spawn_signal_thread(shared.clone());
+    spawn_health_checker(shared.clone());
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     eprintln!(
         "sni-router: starting {} listener(s) on {} core(s)",
-        shared.cfg.listeners.len(),
+        shared.state.load().cfg.listeners.len(),
         cores
     );
 
@@ -102,7 +127,7 @@ fn worker(core: usize, shared: Arc<Shared>) {
 
         // Admin API: a single control-plane listener, only on core 0.
         if core == 0 {
-            if let Some(admin) = &shared.cfg.admin {
+            if let Some(admin) = &shared.state.load().cfg.admin {
                 match TcpListener::bind(admin.bind.as_str()) {
                     Ok(l) => {
                         eprintln!("sni-router: admin API on {}", admin.bind);
@@ -114,7 +139,10 @@ fn worker(core: usize, shared: Arc<Shared>) {
             }
         }
 
-        for (idx, l) in shared.cfg.listeners.iter().enumerate() {
+        // Listener bind/proto structure is fixed for the process lifetime (SIGHUP
+        // does not touch it), so it's safe to read once here.
+        let snapshot = shared.state.load_full();
+        for (idx, l) in snapshot.cfg.listeners.iter().enumerate() {
             for bind in &l.bind {
                 let addr: SocketAddr = match bind.parse() {
                     Ok(a) => a,
@@ -181,8 +209,10 @@ async fn handle_tcp(
     listener_idx: usize,
     shared: Arc<Shared>,
 ) -> io::Result<()> {
-    let cfg = &shared.cfg;
-    let acl = shared.acls[listener_idx].as_ref();
+    // load_full (owned Arc) rather than a Guard: this is held for the whole
+    // (possibly long-lived) connection, and Guards are meant to be short.
+    let st = shared.state.load_full();
+    let acl = st.acls.get(listener_idx).and_then(|a| a.as_ref());
 
     // IP ACL: reject before we spend any effort reading the handshake.
     if let Some(acl) = acl {
@@ -191,8 +221,8 @@ async fn handle_tcp(
         }
     }
 
-    let max = cfg.limits.max_client_hello;
-    let hs_timeout = Duration::from_secs(cfg.timeouts.handshake);
+    let max = st.cfg.limits.max_client_hello;
+    let hs_timeout = Duration::from_secs(st.cfg.timeouts.handshake);
 
     // Buffer the ClientHello (across as many reads as it takes) and pull the SNI.
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
@@ -226,39 +256,46 @@ async fn handle_tcp(
         }
     }
 
-    let routes = &cfg.listeners[listener_idx].routes;
+    let routes = &st.cfg.listeners[listener_idx].routes;
     let backend_name = match router::pick(routes, &sni) {
         Some(b) => b,
         None => return Ok(()), // no matching route (and no catch-all) — drop
     };
-    let pool = match shared.pools.get(backend_name) {
+    let pool = match st.pools.get(backend_name) {
         Some(p) => p,
         None => return Ok(()),
     };
-    let idx = pool.pick();
+
+    // Connect with retry across the pool: on failure try the next server
+    // (healthy ones first). A live connect failure also marks the server down
+    // when health checks are on, so the checker owns bringing it back.
+    let connect_timeout = Duration::from_secs(st.cfg.timeouts.connect);
+    let mut tried: Vec<usize> = Vec::new();
+    let (idx, backend_tcp) = loop {
+        let cand = match pool.pick_candidate(&tried) {
+            Some(i) => i,
+            None => return Ok(()), // every server failed — drop
+        };
+        tried.push(cand);
+        match monoio::time::timeout(connect_timeout, TcpStream::connect(pool.addr(cand))).await {
+            Ok(Ok(s)) => break (cand, s),
+            _ => {
+                if pool.health_check() {
+                    pool.set_healthy(cand, false);
+                }
+            }
+        }
+    };
     let _guard = ConnGuard::new(pool, idx);
-    let addr = pool.addr(idx);
 
     if pool.mode == Mode::Terminate {
         return match shared.terminate.get(backend_name) {
-            Some(ctx) => crate::terminate::handle(buf, client, peer, &sni, addr, ctx).await,
+            Some(ctx) => crate::terminate::handle(buf, client, peer, &sni, backend_tcp, ctx).await,
             None => Ok(()), // TLS context failed to build at startup — drop
         };
     }
 
-    let connect_timeout = Duration::from_secs(cfg.timeouts.connect);
-    let mut upstream = match monoio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            eprintln!("connect {addr}: {e}");
-            return Ok(());
-        }
-        Err(_) => {
-            eprintln!("connect {addr}: timeout");
-            return Ok(());
-        }
-    };
-
+    let mut upstream = backend_tcp;
     // PROXY protocol header carries the real client IP (the only way to pass it
     // in passthrough). `local` is what the client connected to on the router.
     let header = match pool.proxy_protocol {
@@ -269,43 +306,121 @@ async fn handle_tcp(
     if let Some(h) = header {
         upstream.write_all(h).await.0?;
     }
-    // Replay the buffered ClientHello verbatim, then splice the rest.
+    // Replay the buffered ClientHello verbatim, then hand both directions to the
+    // kernel via splice.
     upstream.write_all(buf).await.0?;
 
-    let idle = Duration::from_secs(cfg.timeouts.idle);
     let (cr, cw) = client.into_split();
     let (ur, uw) = upstream.into_split();
-    let up = monoio::spawn(copy_half(cr, uw, idle)); // client -> backend
-    copy_half(ur, cw, idle).await; // backend -> client
-    let _ = up.await;
+    let c2u = monoio::spawn(splice_dir(cr, uw)); // client -> backend
+    splice_dir(ur, cw).await; // backend -> client
+    let _ = c2u.await;
     Ok(())
 }
 
-/// Copy one direction until EOF, error, or an idle-timeout with no data.
-async fn copy_half<R, W>(mut r: R, mut w: W, idle: Duration)
+/// Zero-copy one direction with `splice` until EOF, then close the write side.
+async fn splice_dir<R, W>(mut r: R, mut w: W)
 where
-    R: AsyncReadRent,
-    W: AsyncWriteRent,
+    R: AsReadFd,
+    W: AsWriteFd + AsyncWriteRent,
 {
-    let mut buf = vec![0u8; COPY_BUF];
-    loop {
-        let (res, b) = match monoio::time::timeout(idle, r.read(buf)).await {
-            Ok(v) => v,
-            Err(_) => break, // idle timeout
-        };
-        buf = b;
-        let n = match res {
-            Ok(0) => break, // EOF
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        let (wres, slice) = w.write_all(buf.slice(..n)).await;
-        buf = slice.into_inner();
-        if wres.is_err() {
-            break;
-        }
-    }
+    let _ = monoio::io::zero_copy(&mut r, &mut w).await;
     let _ = w.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// SIGHUP reload + health checks
+// ---------------------------------------------------------------------------
+
+/// Rebuild reloadable state from the config file. Invalid configs and
+/// bind/proto changes are rejected; the running config keeps serving.
+fn reload(shared: &Shared) {
+    let cfg = match crate::config::load(&shared.config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sni-router: reload failed to parse config: {e}; keeping running config");
+            return;
+        }
+    };
+    let diags = crate::config::validate::validate(&cfg);
+    if diags.iter().any(|d| d.level == Level::Error) {
+        eprintln!("sni-router: reload rejected — new config has errors; keeping running config:");
+        for d in diags.iter().filter(|d| d.level == Level::Error) {
+            eprintln!("  {}: {}", d.path, d.message);
+        }
+        return;
+    }
+    if !same_listeners(&shared.state.load().cfg, &cfg) {
+        eprintln!(
+            "sni-router: reload rejected — listener bind/proto changes require a restart; \
+             keeping running config"
+        );
+        return;
+    }
+    shared.state.store(Arc::new(build_state(cfg)));
+    eprintln!("sni-router: configuration reloaded");
+}
+
+/// Do the two configs have the same listener bind/proto structure? (SIGHUP can
+/// only change routes/backends/timeouts/acls, not the accept sockets.)
+fn same_listeners(a: &Config, b: &Config) -> bool {
+    a.listeners.len() == b.listeners.len()
+        && a.listeners.iter().zip(&b.listeners).all(|(x, y)| {
+            x.proto == y.proto && {
+                let mut xb = x.bind.clone();
+                let mut yb = y.bind.clone();
+                xb.sort();
+                yb.sort();
+                xb == yb
+            }
+        })
+}
+
+#[cfg(unix)]
+fn spawn_signal_thread(shared: Arc<Shared>) {
+    std::thread::spawn(move || {
+        let mut signals =
+            match signal_hook::iterator::Signals::new([signal_hook::consts::SIGHUP]) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("sni-router: SIGHUP handler setup failed: {e}");
+                    return;
+                }
+            };
+        for _ in signals.forever() {
+            reload(&shared);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_signal_thread(_shared: Arc<Shared>) {}
+
+/// Background TCP-connect health probing for backends with `health_check: true`.
+/// Runs on a dedicated system thread with blocking connects — off the io_uring
+/// data path.
+fn spawn_health_checker(shared: Arc<Shared>) {
+    std::thread::spawn(move || loop {
+        let (interval, connect_to) = {
+            let st = shared.state.load();
+            (st.cfg.timeouts.health_interval.max(1), st.cfg.timeouts.connect.max(1))
+        };
+        std::thread::sleep(Duration::from_secs(interval));
+        let st = shared.state.load_full();
+        for pool in st.pools.values() {
+            if !pool.health_check() {
+                continue;
+            }
+            for i in 0..pool.server_count() {
+                let up = std::net::TcpStream::connect_timeout(
+                    &pool.addr(i),
+                    Duration::from_secs(connect_to),
+                )
+                .is_ok();
+                pool.set_healthy(i, up);
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +450,6 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
     let sock = Rc::new(sock);
     let mut flows: HashMap<SocketAddr, Flow> = HashMap::new();
     let mut ticks: u32 = 0;
-    let idle = Duration::from_secs(shared.cfg.timeouts.idle);
 
     loop {
         let buf = vec![0u8; UDP_DGRAM_MAX];
@@ -345,6 +459,9 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
             Err(_) => continue,
         };
         let dgram = &buf[..n];
+
+        let st = shared.state.load_full();
+        let idle = Duration::from_secs(st.cfg.timeouts.idle);
 
         ticks = ticks.wrapping_add(1);
         if ticks % UDP_SWEEP_EVERY == 0 {
@@ -366,7 +483,7 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
         }
 
         // New flow.
-        if let Some(acl) = shared.acls[listener_idx].as_ref() {
+        if let Some(acl) = st.acls.get(listener_idx).and_then(|a| a.as_ref()) {
             if !acl.ip_allowed(peer.ip()) {
                 continue; // IP not permitted on this listener
             }
@@ -421,17 +538,19 @@ async fn route_udp(
     shared: &Arc<Shared>,
     sock: &Rc<UdpSocket>,
 ) {
+    let st = shared.state.load_full();
+
     // SNI ACL for the QUIC listener.
-    if let Some(acl) = shared.acls[listener_idx].as_ref() {
+    if let Some(acl) = st.acls.get(listener_idx).and_then(|a| a.as_ref()) {
         if !acl.sni_allowed(&sni) {
             flows.remove(&peer);
             return;
         }
     }
 
-    let routes = &shared.cfg.listeners[listener_idx].routes;
+    let routes = &st.cfg.listeners[listener_idx].routes;
     let decision = router::pick(routes, &sni)
-        .and_then(|name| shared.pools.get(name))
+        .and_then(|name| st.pools.get(name))
         .filter(|p| p.mode != Mode::Terminate); // terminate not valid for udp
 
     let Some(pool) = decision else {
@@ -464,6 +583,7 @@ async fn route_udp(
         }
     }
 
+    let idle = Duration::from_secs(st.cfg.timeouts.idle);
     let Some(flow) = flows.get_mut(&peer) else { return };
     flow.upstream = up.clone();
     flow.backend = addr;
@@ -475,7 +595,6 @@ async fn route_udp(
 
     // Pump backend -> client for this flow.
     let sock = sock.clone();
-    let idle = Duration::from_secs(shared.cfg.timeouts.idle);
     monoio::spawn(async move {
         let mut buf = vec![0u8; UDP_DGRAM_MAX];
         loop {

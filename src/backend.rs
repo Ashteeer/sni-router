@@ -8,15 +8,19 @@
 
 use crate::config::{Backend, Balance, Mode, ProxyProtocol};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub struct Pool {
     pub servers: Vec<SocketAddr>,
     pub mode: Mode,
     pub proxy_protocol: ProxyProtocol,
     pub balance: Balance,
+    health_check: bool,
     rr: AtomicUsize,
     conns: Vec<AtomicUsize>,
+    /// Per-server up/down flag maintained by the health checker and by connect
+    /// failures (only consulted when `health_check` is on).
+    healthy: Vec<AtomicBool>,
 }
 
 impl Pool {
@@ -29,32 +33,69 @@ impl Pool {
             return None;
         }
         let conns = servers.iter().map(|_| AtomicUsize::new(0)).collect();
+        let healthy = servers.iter().map(|_| AtomicBool::new(true)).collect();
         Some(Pool {
             servers,
             mode: b.mode,
             proxy_protocol: b.proxy_protocol,
             balance: b.balance,
+            health_check: b.health_check,
             rr: AtomicUsize::new(0),
             conns,
+            healthy,
         })
     }
 
-    /// Pick a server index according to the balancing policy.
+    pub fn health_check(&self) -> bool {
+        self.health_check
+    }
+
+    pub fn server_count(&self) -> usize {
+        self.servers.len()
+    }
+
+    pub fn set_healthy(&self, idx: usize, up: bool) {
+        self.healthy[idx].store(up, Ordering::Relaxed);
+    }
+
+    /// Pick a server for a UDP flow (no retry, so no health filtering).
     pub fn pick(&self) -> usize {
+        self.balance_over(&(0..self.servers.len()).collect::<Vec<_>>())
+    }
+
+    /// Pick the next server to try, excluding those already `tried`. Healthy
+    /// servers are preferred; if all healthy ones are exhausted it falls back to
+    /// unhealthy ones (fail-open — better to try than to blackhole). Returns
+    /// `None` once every server has been tried.
+    pub fn pick_candidate(&self, tried: &[usize]) -> Option<usize> {
+        let eligible = |only_healthy: bool| -> Vec<usize> {
+            (0..self.servers.len())
+                .filter(|i| {
+                    !tried.contains(i) && (!only_healthy || self.healthy[*i].load(Ordering::Relaxed))
+                })
+                .collect()
+        };
+        let set = if self.health_check {
+            let healthy = eligible(true);
+            if healthy.is_empty() { eligible(false) } else { healthy }
+        } else {
+            eligible(false)
+        };
+        if set.is_empty() {
+            None
+        } else {
+            Some(self.balance_over(&set))
+        }
+    }
+
+    /// Apply the balancing policy over a set of candidate indices.
+    fn balance_over(&self, set: &[usize]) -> usize {
         match self.balance {
-            Balance::RoundRobin => self.rr.fetch_add(1, Ordering::Relaxed) % self.servers.len(),
-            Balance::LeastConn => {
-                let mut best = 0;
-                let mut best_n = usize::MAX;
-                for (i, c) in self.conns.iter().enumerate() {
-                    let n = c.load(Ordering::Relaxed);
-                    if n < best_n {
-                        best_n = n;
-                        best = i;
-                    }
-                }
-                best
-            }
+            Balance::RoundRobin => set[self.rr.fetch_add(1, Ordering::Relaxed) % set.len()],
+            Balance::LeastConn => *set
+                .iter()
+                .min_by_key(|i| self.conns[**i].load(Ordering::Relaxed))
+                .expect("non-empty set"),
         }
     }
 
@@ -122,6 +163,20 @@ mod tests {
             .unwrap();
         let _g = ConnGuard::new(&p, 0); // server 0 now has 1 connection
         assert_eq!(p.pick(), 1); // least loaded
+    }
+
+    #[test]
+    fn candidate_excludes_tried_and_prefers_healthy() {
+        let mut b = backend(&["10.0.0.1:1", "10.0.0.2:2", "10.0.0.3:3"], Balance::RoundRobin);
+        b.health_check = true;
+        let p = Pool::from_backend(&b).unwrap();
+        p.set_healthy(0, false);
+        // server 0 is down, so it must not be the first candidate.
+        assert_ne!(p.pick_candidate(&[]).unwrap(), 0);
+        // once the healthy ones are tried, fall back to the unhealthy one.
+        assert_eq!(p.pick_candidate(&[1, 2]).unwrap(), 0);
+        // everything tried -> give up.
+        assert_eq!(p.pick_candidate(&[0, 1, 2]), None);
     }
 
     #[test]

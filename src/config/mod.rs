@@ -197,11 +197,14 @@ pub struct Timeouts {
     pub connect: u64,
     /// Idle connection timeout.
     pub idle: u64,
+    /// How often to run backend health-check probes (for backends with
+    /// `health_check: true`).
+    pub health_interval: u64,
 }
 
 impl Default for Timeouts {
     fn default() -> Self {
-        Self { handshake: 5, connect: 10, idle: 300 }
+        Self { handshake: 5, connect: 10, idle: 300, health_interval: 10 }
     }
 }
 

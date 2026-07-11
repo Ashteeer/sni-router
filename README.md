@@ -32,10 +32,11 @@ Early development — **not production-ready yet**.
 | QUIC v2 (RFC 9369) Initial decryption | done |
 | Read-only admin/REST API (`/status`, `/config`, `/healthz`) | done |
 | Zero-downtime cert reload (certbot/lego renewals) | done |
-| Backend health checks (TCP connect probe) | planned |
-| Hot reload on SIGHUP (validate first, keep old config on failure) | planned |
+| Backend health checks (TCP probe) + connect retry across the pool | done |
+| Zero-copy `splice()` TCP forwarding | done |
+| WebSocket / HTTP Upgrade tunneling in terminate mode | done |
+| Hot reload on SIGHUP (validate first, keep old config on failure) | done |
 | Rate limiting, Prometheus metrics, access logs | planned |
-| Zero-copy `splice()` forwarding (currently buffered copy) | planned |
 
 **Resilience to DPI-bypass clients (Zapret / GoodbyeDPI / byedpi):** the SNI
 parser never assumes the ClientHello arrives in one piece — it reassembles

@@ -256,6 +256,7 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         ("handshake", cfg.timeouts.handshake),
         ("connect", cfg.timeouts.connect),
         ("idle", cfg.timeouts.idle),
+        ("health_interval", cfg.timeouts.health_interval),
     ] {
         let p = format!("timeouts.{field}");
         if v == 0 {

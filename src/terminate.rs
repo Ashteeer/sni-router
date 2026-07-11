@@ -9,7 +9,8 @@
 
 use crate::config::{Backend, Headers};
 use arc_swap::ArcSwap;
-use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, PrefixedReadIo};
+use monoio::buf::IoBuf;
+use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, PrefixedReadIo, Split, Splitable};
 use monoio::net::TcpStream;
 use monoio_rustls::{TlsAcceptor, TlsConnector};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -207,14 +208,15 @@ fn mtime(p: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-/// Handle one terminate connection: `prefix` is the ClientHello bytes already
-/// read off the socket; they are replayed into the TLS handshake.
+/// Handle one terminate connection. `prefix` is the ClientHello bytes already
+/// read off the socket (replayed into the TLS handshake); `backend` is an
+/// already-connected TCP stream (so pool retry/health lives in one place).
 pub async fn handle(
     prefix: Vec<u8>,
     client: TcpStream,
     peer: SocketAddr,
     sni: &str,
-    backend_addr: SocketAddr,
+    backend: TcpStream,
     ctx: &TerminateCtx,
 ) -> io::Result<()> {
     let io = PrefixedReadIo::new(client, Cursor::new(prefix));
@@ -224,7 +226,6 @@ pub async fn handle(
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls accept: {e}")))?;
 
-    let backend = TcpStream::connect(backend_addr).await?;
     match &ctx.backend {
         None => http_forward(Buf::new(tls), Buf::new(backend), peer, &ctx.headers).await,
         Some(bc) => {
@@ -384,8 +385,8 @@ async fn http_forward<C, B>(
     headers: &Headers,
 ) -> io::Result<()>
 where
-    C: AsyncReadRent + AsyncWriteRent,
-    B: AsyncReadRent + AsyncWriteRent,
+    C: AsyncReadRent + AsyncWriteRent + Split + 'static,
+    B: AsyncReadRent + AsyncWriteRent + Split + 'static,
 {
     loop {
         // --- request ---
@@ -408,8 +409,15 @@ where
             Some(h) => h,
             None => return Ok(()), // backend closed
         };
-        backend_head_to_client(&rhead, &mut client).await?;
-        match body_len(&rhead, false, is_head)? {
+        let status = status_of(&rhead);
+        let body = body_len(&rhead, false, is_head)?; // parse before we move rhead
+        client.write_all(rhead).await?;
+        // 101 Switching Protocols (WebSocket / other Upgrade): the framing ends
+        // here — hand off to a raw full-duplex tunnel.
+        if status == Some(101) {
+            return upgrade_tunnel(client, backend).await;
+        }
+        match body {
             Body::None => {}
             Body::Length(n) => forward_n(&mut backend, &mut client, n).await?,
             Body::Chunked => forward_chunked(&mut backend, &mut client).await?,
@@ -421,11 +429,57 @@ where
     }
 }
 
-async fn backend_head_to_client<C: AsyncReadRent + AsyncWriteRent>(
-    head: &[u8],
-    client: &mut Buf<C>,
-) -> io::Result<()> {
-    client.write_all(head.to_vec()).await
+/// Parse the status code from an HTTP response head.
+fn status_of(head: &[u8]) -> Option<u16> {
+    let line = head.split(|&b| b == b'\r').next()?;
+    let text = std::str::from_utf8(line).ok()?;
+    text.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// After a `101`, tunnel bytes in both directions with no HTTP framing.
+async fn upgrade_tunnel<C, B>(client: Buf<C>, backend: Buf<B>) -> io::Result<()>
+where
+    C: AsyncReadRent + AsyncWriteRent + Split + 'static,
+    B: AsyncReadRent + AsyncWriteRent + Split + 'static,
+{
+    let Buf { s: cs, data: cleft } = client;
+    let Buf { s: bs, data: bleft } = backend;
+    let (cr, mut cw) = Splitable::into_split(cs);
+    let (br, mut bw) = Splitable::into_split(bs);
+    // Drain whatever each side already read past the handshake.
+    if !bleft.is_empty() {
+        cw.write_all(bleft).await.0?;
+    }
+    if !cleft.is_empty() {
+        bw.write_all(cleft).await.0?;
+    }
+    let c2b = monoio::spawn(tunnel_copy(cr, bw));
+    tunnel_copy(br, cw).await;
+    let _ = c2b.await;
+    Ok(())
+}
+
+async fn tunnel_copy<R, W>(mut r: R, mut w: W)
+where
+    R: AsyncReadRent,
+    W: AsyncWriteRent,
+{
+    let mut buf = vec![0u8; IO_CHUNK];
+    loop {
+        let (res, b) = r.read(buf).await;
+        buf = b;
+        let n = match res {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let (wres, slice) = w.write_all(buf.slice(..n)).await;
+        buf = slice.into_inner();
+        if wres.is_err() {
+            break;
+        }
+    }
+    let _ = w.shutdown().await;
 }
 
 enum Body {

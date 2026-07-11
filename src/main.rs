@@ -114,7 +114,7 @@ fn main() -> ExitCode {
         eprintln!("refusing to start with an invalid configuration");
         return ExitCode::FAILURE;
     }
-    match server::run(cfg) {
+    match server::run(cfg, path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("fatal: {e}");

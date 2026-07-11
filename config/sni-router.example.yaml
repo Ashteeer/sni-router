@@ -28,7 +28,9 @@ backends:
     mode: passthrough           # passthrough | terminate — what THIS backend expects
     proxy_protocol: v2          # none | v1 | v2 — how to pass the real client IP
     balance: round_robin        # round_robin | least_conn
-    health_check: true          # TCP connect probe (default: false)
+    health_check: true          # per-backend TCP connect probe (default: false).
+                                # On failure a server is skipped; connects always
+                                # retry the next server in the pool regardless.
     servers:
       - "10.0.0.1:443"
       - "10.0.0.2:443"
@@ -62,3 +64,9 @@ timeouts:
   handshake: 5                  # max time to read ClientHello (slowloris protection)
   connect: 10                   # backend connect timeout
   idle: 300                     # idle connection timeout
+  health_interval: 10           # how often to run health-check probes
+
+# Reload without a restart: `kill -HUP <pid>` (or `systemctl reload sni-router`)
+# re-reads this file, validates it, and applies route/backend/timeout/acl changes
+# to new connections. Invalid configs are rejected and the running one keeps
+# serving. Changing listener bind addresses still requires a restart.

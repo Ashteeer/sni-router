@@ -57,7 +57,8 @@ async fn handle(mut s: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     let path = parts.next().unwrap_or("");
 
     // Bearer-token auth, if configured.
-    if let Some(token) = shared.cfg.admin.as_ref().and_then(|a| a.token.as_deref()) {
+    let state = shared.state.load_full();
+    if let Some(token) = state.cfg.admin.as_ref().and_then(|a| a.token.as_deref()) {
         let expected = format!("Bearer {token}");
         let authorized = head.split("\r\n").any(|l| {
             l.split_once(':').is_some_and(|(n, v)| {
@@ -76,21 +77,21 @@ async fn handle(mut s: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     match path {
         "/healthz" => respond(&mut s, 200, "OK", "text/plain", b"ok\n").await,
         "/status" => {
-            let body = status_json(&shared);
+            let body = status_json(&state, shared.started);
             respond(&mut s, 200, "OK", "application/json", body.as_bytes()).await
         }
         "/config" => {
             // The admin token is `skip_serializing`, so it never appears here.
-            let body = serde_norway::to_string(&shared.cfg).unwrap_or_default();
+            let body = serde_norway::to_string(&state.cfg).unwrap_or_default();
             respond(&mut s, 200, "OK", "application/yaml", body.as_bytes()).await
         }
         _ => respond(&mut s, 404, "Not Found", "text/plain", b"not found\n").await,
     }
 }
 
-fn status_json(shared: &Shared) -> String {
-    let uptime = shared.started.elapsed().as_secs();
-    let listeners = shared
+fn status_json(state: &crate::server::State, started: std::time::Instant) -> String {
+    let uptime = started.elapsed().as_secs();
+    let listeners = state
         .cfg
         .listeners
         .iter()
@@ -110,7 +111,7 @@ fn status_json(shared: &Shared) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
-    let backends = shared
+    let backends = state
         .cfg
         .backends
         .iter()
