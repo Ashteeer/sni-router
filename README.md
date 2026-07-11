@@ -22,13 +22,21 @@ Early development — **not production-ready yet**.
 | Milestone | State |
 |---|---|
 | Config parsing + static validation (`sni-router -t`, like `nginx -t`) | done |
-| TCP passthrough with SNI extraction | next |
-| PROXY protocol v1/v2 (real client IP for backends) | planned |
-| UDP/QUIC passthrough (SNI from the QUIC Initial packet) | planned |
-| Backend pools: round-robin / least-conn, health checks | planned |
+| TCP passthrough with SNI extraction (robust to fragmented ClientHello) | done |
+| PROXY protocol v1/v2 (real client IP for backends) | done |
+| UDP/QUIC passthrough (SNI from the QUIC Initial packet) | done |
+| Backend pools: round-robin / least-conn | done |
+| Backend health checks (TCP connect probe) | planned |
 | Hot reload on SIGHUP (validate first, keep old config on failure) | planned |
 | Rate limiting, Prometheus metrics, access logs | planned |
+| Zero-copy `splice()` forwarding (currently buffered copy) | planned |
 | TLS termination mode (`mode: terminate`) | post-MVP |
+
+**Resilience to DPI-bypass clients (Zapret / GoodbyeDPI / byedpi):** the SNI
+parser never assumes the ClientHello arrives in one piece — it reassembles
+across TCP segments and TLS records, and fake packets (bad checksum / TTL) are
+dropped by the kernel before they reach it. On QUIC, a fake Initial simply
+fails AEAD authentication and is ignored while the real one is awaited.
 
 ## Quick start
 

@@ -432,6 +432,9 @@ async fn route_udp(
     });
 }
 
+/// A fresh unconnected UDP socket for talking to a backend. Left unconnected on
+/// purpose: we address the backend with `send_to`, and a `send_to` with an
+/// explicit destination on a *connected* UDP socket can return `EISCONN`.
 fn connect_udp(backend: SocketAddr) -> io::Result<UdpSocket> {
     let bind: SocketAddr = if backend.is_ipv6() {
         "[::]:0".parse().unwrap()
@@ -439,7 +442,6 @@ fn connect_udp(backend: SocketAddr) -> io::Result<UdpSocket> {
         "0.0.0.0:0".parse().unwrap()
     };
     let std_sock = std::net::UdpSocket::bind(bind)?;
-    std_sock.connect(backend)?;
     UdpSocket::from_std(std_sock)
 }
 
@@ -485,7 +487,7 @@ fn pin_to_core(core: usize) {
     #[cfg(target_os = "linux")]
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(core % libc::CPU_SETSIZE, &mut set);
+        libc::CPU_SET(core % libc::CPU_SETSIZE as usize, &mut set);
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
     }
     #[cfg(not(target_os = "linux"))]

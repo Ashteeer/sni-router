@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use aes::cipher::{BlockEncrypt, KeyInit as BlockKeyInit};
 use aes::Aes128;
-use aes_gcm::aead::{Aead, KeyInit as AeadKeyInit, Payload};
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -79,21 +79,6 @@ pub fn scan(datagram: &[u8]) -> Scan {
         }
     }
     Scan::Crypto(frags)
-}
-
-/// Convenience single-datagram path (used by tests and the common case where
-/// the whole ClientHello fits in one datagram).
-pub fn extract_sni(datagram: &[u8]) -> Sni {
-    match scan(datagram) {
-        Scan::Crypto(frags) => {
-            let mut r = CryptoReasm::new();
-            for (off, data) in frags {
-                r.push(off, &data);
-            }
-            r.try_sni()
-        }
-        Scan::Fake | Scan::NotInitial => Sni::NotClientHello,
-    }
 }
 
 fn looks_like_initial_v1(pkt: &[u8]) -> bool {
@@ -377,6 +362,21 @@ mod tests {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 
+    /// Single-datagram SNI extraction (scan + reassemble), as the runtime does
+    /// it inline.
+    fn sni_of(datagram: &[u8]) -> Sni {
+        match scan(datagram) {
+            Scan::Crypto(frags) => {
+                let mut r = CryptoReasm::new();
+                for (off, data) in frags {
+                    r.push(off, &data);
+                }
+                r.try_sni()
+            }
+            Scan::Fake | Scan::NotInitial => Sni::NotClientHello,
+        }
+    }
+
     #[test]
     fn key_schedule_matches_rfc9001() {
         let keys = Keys::derive(&RFC_DCID);
@@ -453,7 +453,7 @@ mod tests {
     fn roundtrip_single_datagram() {
         let ch = client_hello(Some("quic.example.com"));
         let pkt = seal_initial(&RFC_DCID, 1, crypto_frame(0, &ch));
-        assert_eq!(extract_sni(&pkt), Sni::Found("quic.example.com".into()));
+        assert_eq!(sni_of(&pkt), Sni::Found("quic.example.com".into()));
     }
 
     #[test]
@@ -477,7 +477,7 @@ mod tests {
         let mut frames = crypto_frame(0, &ch[..mid]);
         frames.extend(crypto_frame(mid as u64, &ch[mid..]));
         let pkt = seal_initial(&RFC_DCID, 1, frames);
-        assert_eq!(extract_sni(&pkt), Sni::Found("frag.example.com".into()));
+        assert_eq!(sni_of(&pkt), Sni::Found("frag.example.com".into()));
     }
 
     #[test]
