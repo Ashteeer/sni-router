@@ -27,7 +27,10 @@ pub fn matches(pattern: &str, sni: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix('*') {
         // "*.example.com" -> suffix ".example.com": require at least one label
         // in front of the dot so the apex "example.com" does not match.
-        return sni.len() > suffix.len() && sni.to_ascii_lowercase().ends_with(suffix);
+        // Case-insensitive on both sides (DNS names are).
+        let suffix = suffix.to_ascii_lowercase();
+        let sni = sni.to_ascii_lowercase();
+        return sni.len() > suffix.len() && sni.ends_with(&suffix);
     }
     pattern.eq_ignore_ascii_case(sni)
 }
@@ -48,6 +51,12 @@ mod tests {
         assert!(matches("*.example.com", "deep.sub.example.com"));
         assert!(!matches("*.example.com", "example.com"));
         assert!(!matches("*.example.com", "notexample.com"));
+    }
+
+    #[test]
+    fn wildcard_is_case_insensitive_both_sides() {
+        assert!(matches("*.Example.COM", "A.example.com"));
+        assert!(matches("*.example.com", "A.EXAMPLE.COM"));
     }
 
     #[test]
