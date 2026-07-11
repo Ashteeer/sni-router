@@ -2,6 +2,8 @@ mod acl;
 mod admin;
 mod backend;
 mod config;
+mod logging;
+mod metrics;
 mod protocol;
 mod router;
 mod server;
@@ -114,6 +116,12 @@ fn main() -> ExitCode {
         eprintln!("refusing to start with an invalid configuration");
         return ExitCode::FAILURE;
     }
+
+    logging::init(&cfg.log);
+    if let Some(m) = &cfg.metrics {
+        metrics::spawn(m.bind.clone());
+    }
+
     match server::run(cfg, path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

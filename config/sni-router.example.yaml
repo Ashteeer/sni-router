@@ -65,8 +65,32 @@ timeouts:
   connect: 10                   # backend connect timeout
   idle: 300                     # idle connection timeout
   health_interval: 10           # how often to run health-check probes
+  drain: 30                     # on SIGTERM, how long to wait for active conns
+
+# Resource limits.
+limits:
+  max_client_hello: 16384       # max bytes buffered while reassembling ClientHello
+  max_conns_per_ip: 0           # max concurrent TCP connections per client IP (0 = off)
+
+# Logging.
+log:
+  level: info                   # error | warn | info | debug | trace (RUST_LOG overrides)
+  format: text                  # text | json (json = one object per line, for log shippers)
+
+# Prometheus metrics exporter (optional). Served by a tiny blocking HTTP server
+# on its own thread — scrape GET /metrics. Keep it on a trusted interface.
+# metrics:
+#   bind: "127.0.0.1:9100"
+
+# Read-only admin/REST API (optional): GET /status, /config, /healthz.
+# admin:
+#   bind: "127.0.0.1:9000"
+#   token: "change-me"          # optional Bearer token (never echoed by /config)
 
 # Reload without a restart: `kill -HUP <pid>` (or `systemctl reload sni-router`)
 # re-reads this file, validates it, and applies route/backend/timeout/acl changes
 # to new connections. Invalid configs are rejected and the running one keeps
 # serving. Changing listener bind addresses still requires a restart.
+#
+# Graceful shutdown: `kill -TERM <pid>` stops accepting new connections and waits
+# up to `timeouts.drain` seconds for active ones to finish before exiting.

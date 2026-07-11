@@ -257,6 +257,7 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         ("connect", cfg.timeouts.connect),
         ("idle", cfg.timeouts.idle),
         ("health_interval", cfg.timeouts.health_interval),
+        ("drain", cfg.timeouts.drain),
     ] {
         let p = format!("timeouts.{field}");
         if v == 0 {
@@ -274,6 +275,27 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                 format!("invalid address \"{}\" — expected IP:port", admin.bind),
             ));
         }
+    }
+
+    // Metrics exporter bind address.
+    if let Some(m) = &cfg.metrics {
+        if m.bind.parse::<SocketAddr>().is_err() {
+            d.push(Diagnostic::error(
+                "metrics.bind",
+                format!("invalid address \"{}\" — expected IP:port", m.bind),
+            ));
+        }
+    }
+
+    // Log level word.
+    if crate::logging::parse_level(&cfg.log.level).is_none() {
+        d.push(Diagnostic::error(
+            "log.level",
+            format!(
+                "unknown level \"{}\" — expected one of error, warn, info, debug, trace",
+                cfg.log.level
+            ),
+        ));
     }
 
     // Limits.

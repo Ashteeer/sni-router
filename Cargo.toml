@@ -34,6 +34,11 @@ httparse = "1"
 # Lock-free pointer swap for zero-downtime cert reload (and, later, config reload).
 arc-swap = "1"
 
+# Structured logging. Runtime-agnostic (not tokio-bound); `env-filter`/`regex`
+# left out on purpose — the level comes from config/`RUST_LOG` bare level.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi", "json"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 

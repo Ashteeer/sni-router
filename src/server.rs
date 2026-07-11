@@ -29,11 +29,14 @@ use monoio::net::{TcpListener, TcpStream};
 use socket2::{Domain, Protocol as SockProto, Socket, Type};
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::metrics;
 
 const UDP_DGRAM_MAX: usize = 2048;
 const MAX_UDP_FLOWS: usize = 100_000;
@@ -55,6 +58,11 @@ pub struct Shared {
     pub terminate: HashMap<String, crate::terminate::TerminateCtx>,
     pub started: Instant,
     config_path: PathBuf,
+    /// Set on SIGTERM: accept loops stop taking new work and the process drains.
+    shutting_down: AtomicBool,
+    /// Active connection count per client IP, for `limits.max_conns_per_ip`.
+    /// Contended only on connect/disconnect, never on the data path.
+    conns_per_ip: Mutex<HashMap<IpAddr, u32>>,
 }
 
 fn build_state(cfg: Config) -> State {
@@ -82,16 +90,18 @@ pub fn run(cfg: Config, config_path: PathBuf) -> io::Result<()> {
         terminate,
         started: Instant::now(),
         config_path,
+        shutting_down: AtomicBool::new(false),
+        conns_per_ip: Mutex::new(HashMap::new()),
     });
 
     spawn_signal_thread(shared.clone());
     spawn_health_checker(shared.clone());
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    eprintln!(
-        "sni-router: starting {} listener(s) on {} core(s)",
-        shared.state.load().cfg.listeners.len(),
-        cores
+    tracing::info!(
+        listeners = shared.state.load().cfg.listeners.len(),
+        cores,
+        "sni-router starting"
     );
 
     let mut handles = Vec::new();
@@ -117,7 +127,7 @@ fn worker(core: usize, shared: Arc<Shared>) {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("core {core}: failed to build runtime: {e}");
+            tracing::error!(core, error = %e, "failed to build runtime");
             return;
         }
     };
@@ -130,11 +140,11 @@ fn worker(core: usize, shared: Arc<Shared>) {
             if let Some(admin) = &shared.state.load().cfg.admin {
                 match TcpListener::bind(admin.bind.as_str()) {
                     Ok(l) => {
-                        eprintln!("sni-router: admin API on {}", admin.bind);
+                        tracing::info!(bind = %admin.bind, "admin API listening");
                         let sh = shared.clone();
                         tasks.push(monoio::spawn(crate::admin::serve(l, sh)));
                     }
-                    Err(e) => eprintln!("core 0: admin bind {}: {e}", admin.bind),
+                    Err(e) => tracing::error!(bind = %admin.bind, error = %e, "admin bind failed"),
                 }
             }
         }
@@ -155,9 +165,9 @@ fn worker(core: usize, shared: Arc<Shared>) {
                                 let sh = shared.clone();
                                 tasks.push(monoio::spawn(tcp_accept_loop(listener, addr, idx, sh)));
                             }
-                            Err(e) => eprintln!("core {core}: {addr} from_std: {e}"),
+                            Err(e) => tracing::error!(core, %addr, error = %e, "tcp from_std failed"),
                         },
-                        Err(e) => eprintln!("core {core}: bind tcp {addr}: {e}"),
+                        Err(e) => tracing::error!(core, %addr, error = %e, "tcp bind failed"),
                     },
                     Proto::Udp => match reuseport_udp(addr) {
                         Ok(std_s) => match UdpSocket::from_std(std_s) {
@@ -165,9 +175,9 @@ fn worker(core: usize, shared: Arc<Shared>) {
                                 let sh = shared.clone();
                                 tasks.push(monoio::spawn(udp_worker(sock, addr, idx, sh)));
                             }
-                            Err(e) => eprintln!("core {core}: udp from_std {addr}: {e}"),
+                            Err(e) => tracing::error!(core, %addr, error = %e, "udp from_std failed"),
                         },
-                        Err(e) => eprintln!("core {core}: bind udp {addr}: {e}"),
+                        Err(e) => tracing::error!(core, %addr, error = %e, "udp bind failed"),
                     },
                 }
             }
@@ -189,16 +199,79 @@ async fn tcp_accept_loop(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                // Draining on SIGTERM: don't start new work, let the peer retry
+                // elsewhere. Existing connections keep running until they finish.
+                if shared.shutting_down.load(Ordering::Relaxed) {
+                    drop(stream);
+                    return;
+                }
                 let shared = shared.clone();
                 monoio::spawn(async move {
                     let _ = handle_tcp(stream, peer, local, listener_idx, shared).await;
                 });
             }
             Err(e) => {
-                eprintln!("accept {local}: {e}");
+                tracing::warn!(%local, error = %e, "accept failed");
                 monoio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+    }
+}
+
+/// RAII counter for `limits.max_conns_per_ip`. Absent when the limit is 0
+/// (unlimited) so we don't touch the map at all in the common case.
+struct IpLimit<'a> {
+    map: &'a Mutex<HashMap<IpAddr, u32>>,
+    ip: IpAddr,
+}
+
+impl<'a> IpLimit<'a> {
+    /// Try to admit one more connection from `ip`. `None` = at the limit.
+    /// Only called when `limit > 0` (the caller handles the unlimited case).
+    fn acquire(map: &'a Mutex<HashMap<IpAddr, u32>>, ip: IpAddr, limit: usize) -> Option<Self> {
+        let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(ip).or_insert(0);
+        if (*n as usize) >= limit {
+            return None;
+        }
+        *n += 1;
+        Some(IpLimit { map, ip })
+    }
+}
+
+impl Drop for IpLimit<'_> {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// RAII gauge for active connections (global + per-backend). Increments the
+/// totals on creation, decrements the active gauges on drop, so early returns
+/// and errors can't leak the count.
+struct ActiveGuard {
+    backend: Arc<metrics::Backend>,
+}
+
+impl ActiveGuard {
+    fn new(backend: Arc<metrics::Backend>) -> Self {
+        metrics::GLOBAL.conns_total.fetch_add(1, Ordering::Relaxed);
+        metrics::GLOBAL.conns_active.fetch_add(1, Ordering::Relaxed);
+        backend.conns_total.fetch_add(1, Ordering::Relaxed);
+        backend.conns_active.fetch_add(1, Ordering::Relaxed);
+        ActiveGuard { backend }
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        metrics::GLOBAL.conns_active.fetch_sub(1, Ordering::Relaxed);
+        self.backend.conns_active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -221,6 +294,23 @@ async fn handle_tcp(
         }
     }
 
+    // Per-IP connection cap (limits.max_conns_per_ip; 0 = unlimited). Held for
+    // the whole connection; the RAII guard releases the slot on drop.
+    let limit = st.cfg.limits.max_conns_per_ip;
+    let _ip_guard = if limit > 0 {
+        match IpLimit::acquire(&shared.conns_per_ip, peer.ip(), limit) {
+            Some(g) => Some(g),
+            None => {
+                metrics::GLOBAL.rate_limited.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(%peer, limit, "connection rejected: per-IP limit reached");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
+    let start = Instant::now();
     let max = st.cfg.limits.max_client_hello;
     let hs_timeout = Duration::from_secs(st.cfg.timeouts.handshake);
 
@@ -266,6 +356,8 @@ async fn handle_tcp(
         None => return Ok(()),
     };
 
+    let bm = metrics::backend(backend_name);
+
     // Connect with retry across the pool: on failure try the next server
     // (healthy ones first). A live connect failure also marks the server down
     // when health checks are on, so the checker owns bringing it back.
@@ -274,7 +366,13 @@ async fn handle_tcp(
     let (idx, backend_tcp) = loop {
         let cand = match pool.pick_candidate(&tried) {
             Some(i) => i,
-            None => return Ok(()), // every server failed — drop
+            None => {
+                // Every server failed to connect — drop.
+                metrics::GLOBAL.conn_errors.fetch_add(1, Ordering::Relaxed);
+                bm.errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(backend = backend_name, sni = sni_log(&sni), "all backend servers unreachable");
+                return Ok(());
+            }
         };
         tried.push(cand);
         match monoio::time::timeout(connect_timeout, TcpStream::connect(pool.addr(cand))).await {
@@ -287,12 +385,27 @@ async fn handle_tcp(
         }
     };
     let _guard = ConnGuard::new(pool, idx);
+    let _active = ActiveGuard::new(bm.clone());
 
     if pool.mode == Mode::Terminate {
-        return match shared.terminate.get(backend_name) {
+        let res = match shared.terminate.get(backend_name) {
             Some(ctx) => crate::terminate::handle(buf, client, peer, &sni, backend_tcp, ctx).await,
             None => Ok(()), // TLS context failed to build at startup — drop
         };
+        if res.is_err() {
+            metrics::GLOBAL.conn_errors.fetch_add(1, Ordering::Relaxed);
+            bm.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        tracing::info!(
+            target: "access",
+            %peer,
+            sni = sni_log(&sni),
+            backend = backend_name,
+            mode = "terminate",
+            duration_ms = start.elapsed().as_millis() as u64,
+            "connection closed"
+        );
+        return res;
     }
 
     let mut upstream = backend_tcp;
@@ -313,19 +426,46 @@ async fn handle_tcp(
     let (cr, cw) = client.into_split();
     let (ur, uw) = upstream.into_split();
     let c2u = monoio::spawn(splice_dir(cr, uw)); // client -> backend
-    splice_dir(ur, cw).await; // backend -> client
-    let _ = c2u.await;
+    let down = splice_dir(ur, cw).await; // backend -> client
+    let up = c2u.await;
+
+    metrics::GLOBAL.bytes_up.fetch_add(up, Ordering::Relaxed);
+    metrics::GLOBAL.bytes_down.fetch_add(down, Ordering::Relaxed);
+    bm.bytes_up.fetch_add(up, Ordering::Relaxed);
+    bm.bytes_down.fetch_add(down, Ordering::Relaxed);
+    tracing::info!(
+        target: "access",
+        %peer,
+        sni = sni_log(&sni),
+        backend = backend_name,
+        mode = "passthrough",
+        bytes_up = up,
+        bytes_down = down,
+        duration_ms = start.elapsed().as_millis() as u64,
+        "connection closed"
+    );
     Ok(())
 }
 
+/// Render an empty SNI as `-` for access logs.
+fn sni_log(s: &str) -> &str {
+    if s.is_empty() {
+        "-"
+    } else {
+        s
+    }
+}
+
 /// Zero-copy one direction with `splice` until EOF, then close the write side.
-async fn splice_dir<R, W>(mut r: R, mut w: W)
+/// Returns the number of bytes transferred.
+async fn splice_dir<R, W>(mut r: R, mut w: W) -> u64
 where
     R: AsReadFd,
     W: AsWriteFd + AsyncWriteRent,
 {
-    let _ = monoio::io::zero_copy(&mut r, &mut w).await;
+    let n = monoio::io::zero_copy(&mut r, &mut w).await.unwrap_or(0);
     let _ = w.shutdown().await;
+    n as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -338,27 +478,26 @@ fn reload(shared: &Shared) {
     let cfg = match crate::config::load(&shared.config_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("sni-router: reload failed to parse config: {e}; keeping running config");
+            tracing::error!(error = %e, "reload: failed to parse config; keeping running config");
             return;
         }
     };
     let diags = crate::config::validate::validate(&cfg);
     if diags.iter().any(|d| d.level == Level::Error) {
-        eprintln!("sni-router: reload rejected — new config has errors; keeping running config:");
+        tracing::error!("reload rejected: new config has errors; keeping running config");
         for d in diags.iter().filter(|d| d.level == Level::Error) {
-            eprintln!("  {}: {}", d.path, d.message);
+            tracing::error!(path = %d.path, "{}", d.message);
         }
         return;
     }
     if !same_listeners(&shared.state.load().cfg, &cfg) {
-        eprintln!(
-            "sni-router: reload rejected — listener bind/proto changes require a restart; \
-             keeping running config"
+        tracing::error!(
+            "reload rejected: listener bind/proto changes require a restart; keeping running config"
         );
         return;
     }
     shared.state.store(Arc::new(build_state(cfg)));
-    eprintln!("sni-router: configuration reloaded");
+    tracing::info!("configuration reloaded");
 }
 
 /// Do the two configs have the same listener bind/proto structure? (SIGHUP can
@@ -378,23 +517,52 @@ fn same_listeners(a: &Config, b: &Config) -> bool {
 
 #[cfg(unix)]
 fn spawn_signal_thread(shared: Arc<Shared>) {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     std::thread::spawn(move || {
-        let mut signals =
-            match signal_hook::iterator::Signals::new([signal_hook::consts::SIGHUP]) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("sni-router: SIGHUP handler setup failed: {e}");
-                    return;
-                }
-            };
-        for _ in signals.forever() {
-            reload(&shared);
+        let mut signals = match signal_hook::iterator::Signals::new([SIGHUP, SIGTERM, SIGINT]) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "signal handler setup failed");
+                return;
+            }
+        };
+        for sig in signals.forever() {
+            match sig {
+                SIGHUP => reload(&shared),
+                SIGTERM | SIGINT => graceful_shutdown(&shared),
+                _ => {}
+            }
         }
     });
 }
 
 #[cfg(not(unix))]
 fn spawn_signal_thread(_shared: Arc<Shared>) {}
+
+/// Stop accepting new connections, wait for active ones to finish (up to
+/// `timeouts.drain`), then exit. New accepts are refused via `shutting_down`;
+/// this loop watches the active-connection gauge and exits when it hits zero or
+/// the drain deadline passes. Diverges (exits the process).
+#[cfg(unix)]
+fn graceful_shutdown(shared: &Shared) -> ! {
+    let drain = shared.state.load().cfg.timeouts.drain.max(1);
+    shared.shutting_down.store(true, Ordering::Relaxed);
+    tracing::info!(drain_secs = drain, "shutdown signal received; draining connections");
+    let deadline = Instant::now() + Duration::from_secs(drain);
+    loop {
+        let active = metrics::GLOBAL.conns_active.load(Ordering::Relaxed);
+        if active == 0 {
+            tracing::info!("drain complete; exiting");
+            break;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(active, "drain timeout reached; exiting with connections still active");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::process::exit(0);
+}
 
 /// Background TCP-connect health probing for backends with `health_check: true`.
 /// Runs on a dedicated system thread with blocking connects — off the io_uring
@@ -458,6 +626,7 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
             Ok(v) => v,
             Err(_) => continue,
         };
+        metrics::GLOBAL.udp_datagrams.fetch_add(1, Ordering::Relaxed);
         let dgram = &buf[..n];
 
         let st = shared.state.load_full();
@@ -549,25 +718,37 @@ async fn route_udp(
     }
 
     let routes = &st.cfg.listeners[listener_idx].routes;
-    let decision = router::pick(routes, &sni)
-        .and_then(|name| st.pools.get(name))
-        .filter(|p| p.mode != Mode::Terminate); // terminate not valid for udp
-
-    let Some(pool) = decision else {
-        flows.remove(&peer);
-        return;
+    let backend_name = match router::pick(routes, &sni) {
+        Some(n) => n,
+        None => {
+            flows.remove(&peer);
+            return;
+        }
     };
+    // terminate not valid for udp — treat as no route.
+    let pool = match st.pools.get(backend_name).filter(|p| p.mode != Mode::Terminate) {
+        Some(p) => p,
+        None => {
+            flows.remove(&peer);
+            return;
+        }
+    };
+    let bm = metrics::backend(backend_name);
     let idx = pool.pick();
     let addr = pool.addr(idx);
 
     let up = match connect_udp(addr) {
         Ok(u) => Rc::new(u),
         Err(e) => {
-            eprintln!("udp connect {addr}: {e}");
+            tracing::warn!(%addr, error = %e, "udp backend connect failed");
+            bm.errors.fetch_add(1, Ordering::Relaxed);
             flows.remove(&peer);
             return;
         }
     };
+    metrics::GLOBAL.udp_flows_total.fetch_add(1, Ordering::Relaxed);
+    bm.conns_total.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(target: "access", %peer, sni = sni_log(&sni), backend = backend_name, mode = "quic", "flow routed");
 
     // Optional PROXY protocol: sent once as its own leading datagram so the QUIC
     // payload that follows stays byte-exact.

@@ -28,6 +28,46 @@ pub struct Config {
     /// Optional read-only admin/REST API (foundation for a future web UI).
     #[serde(default)]
     pub admin: Option<Admin>,
+    /// Optional Prometheus metrics exporter.
+    #[serde(default)]
+    pub metrics: Option<MetricsExporter>,
+    /// Logging configuration.
+    #[serde(default)]
+    pub log: Log,
+}
+
+/// Prometheus-compatible metrics exporter. Served by a tiny blocking HTTP
+/// server on its own system thread, off the io_uring data path.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsExporter {
+    /// Address to serve `GET /metrics` on, e.g. `127.0.0.1:9100`.
+    pub bind: String,
+}
+
+/// Logging: level and output format.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Log {
+    /// `error` | `warn` | `info` | `debug` | `trace`. A bare `RUST_LOG` level
+    /// overrides this at startup.
+    pub level: String,
+    /// `text` (human-readable) or `json` (one JSON object per line).
+    pub format: LogFormat,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self { level: "info".into(), format: LogFormat::default() }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 /// Admin HTTP API. Read-only: `GET /status`, `GET /config`, `GET /healthz`.
@@ -200,11 +240,14 @@ pub struct Timeouts {
     /// How often to run backend health-check probes (for backends with
     /// `health_check: true`).
     pub health_interval: u64,
+    /// Max time to wait for active connections to finish on SIGTERM before
+    /// exiting (graceful drain).
+    pub drain: u64,
 }
 
 impl Default for Timeouts {
     fn default() -> Self {
-        Self { handshake: 5, connect: 10, idle: 300, health_interval: 10 }
+        Self { handshake: 5, connect: 10, idle: 300, health_interval: 10, drain: 30 }
     }
 }
 

@@ -95,7 +95,7 @@ impl TerminateCtx {
                     });
                     out.insert(name.clone(), ctx);
                 }
-                Err(e) => eprintln!("backend {name}: terminate TLS setup failed: {e}"),
+                Err(e) => tracing::error!(backend = %name, error = %e, "terminate TLS setup failed"),
             }
         }
         (out, watch)
@@ -192,10 +192,10 @@ pub fn spawn_cert_watcher(watch: Vec<CertWatch>) {
                         Ok(ck) => {
                             w.resolver.cert.store(ck);
                             mtimes[i] = m;
-                            eprintln!("sni-router: reloaded certificate {}", w.cert.display());
+                            tracing::info!(cert = %w.cert.display(), "reloaded certificate");
                         }
                         Err(e) => {
-                            eprintln!("sni-router: cert reload {} failed: {e}", w.cert.display())
+                            tracing::error!(cert = %w.cert.display(), error = %e, "cert reload failed")
                         }
                     }
                 }
