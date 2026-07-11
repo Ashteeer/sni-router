@@ -31,6 +31,12 @@ monoio-rustls = "0.4"
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 httparse = "1"
+
+# HTTP/2 termination: native monoio h2 server (a port of hyperium/h2), so no
+# tokio is pulled into the core. We drive it as an h2->HTTP/1.1 gateway.
+monoio-http = "0.3"
+http = "1"
+bytes = "1"
 # Lock-free pointer swap for zero-downtime cert reload (and, later, config reload).
 arc-swap = "1"
 

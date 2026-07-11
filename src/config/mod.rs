@@ -157,6 +157,11 @@ pub struct Backend {
     /// Injected HTTP headers; only applied when `mode: terminate`.
     #[serde(default)]
     pub headers: Headers,
+    /// Advertise HTTP/2 (`h2`) ALPN and terminate it (terminate mode only).
+    /// h2 requests are gatewayed to the backend over HTTP/1.1 plaintext, so it
+    /// is not combinable with `backend_tls`.
+    #[serde(default)]
+    pub http2: bool,
     /// Optional per-path request rules (terminate mode only): forward matching
     /// paths to the backend, answer others with a synthetic response. First
     /// match wins; if empty, every request is forwarded. Envoy-style DoH:

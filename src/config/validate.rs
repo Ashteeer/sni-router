@@ -324,6 +324,20 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                 }
             }
         }
+        // http2 applies only to terminate, and gateways to HTTP/1.1 plaintext.
+        if b.http2 && b.mode != Mode::Terminate {
+            d.push(Diagnostic::warning(
+                format!("{bp}.http2"),
+                "http2 is only applied in terminate mode",
+            ));
+        }
+        if b.http2 && b.mode == Mode::Terminate && b.backend_tls.is_some() {
+            d.push(Diagnostic::error(
+                format!("{bp}.http2"),
+                "http2 termination forwards to the backend over HTTP/1.1 plaintext \
+                 and cannot be combined with backend_tls (re-encrypt)",
+            ));
+        }
         let used = cfg
             .listeners
             .iter()

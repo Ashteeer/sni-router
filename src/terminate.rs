@@ -14,6 +14,10 @@
 
 use crate::config::{Backend, Headers, HttpAction, HttpRule};
 use arc_swap::ArcSwap;
+use bytes::Bytes;
+use http::{Request, Response};
+use monoio_http::h2::server as h2server;
+use monoio_http::h2::{RecvStream, SendStream};
 use monoio::buf::IoBuf;
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, PrefixedReadIo, Split, Splitable};
 use monoio::net::TcpStream;
@@ -41,6 +45,8 @@ pub struct TerminateCtx {
     headers: Headers,
     /// Per-path request rules (terminate mode only; empty = forward all).
     http_rules: Vec<crate::config::HttpRule>,
+    /// Whether `h2` ALPN is advertised and terminated (terminate mode only).
+    http2: bool,
     /// Live-swappable cert (updated by the reload watcher).
     resolver: Arc<SwapResolver>,
     cert_path: PathBuf,
@@ -117,10 +123,15 @@ impl TerminateCtx {
             .map_err(|e| e.to_string())?
             .with_no_client_auth()
             .with_cert_resolver(resolver.clone());
-        // HTTP terminate advertises http/1.1; the raw (terminate_tcp) tunnel
-        // leaves ALPN unset so clients negotiating e.g. "dot" still connect.
+        // HTTP terminate advertises http/1.1 (plus h2 when enabled); the raw
+        // (terminate_tcp) tunnel leaves ALPN unset so clients negotiating e.g.
+        // "dot" still connect.
         if b.mode == crate::config::Mode::Terminate {
-            server.alpn_protocols = vec![b"http/1.1".to_vec()];
+            server.alpn_protocols = if b.http2 {
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+            } else {
+                vec![b"http/1.1".to_vec()]
+            };
         }
 
         // Re-encrypt / mTLS only applies to HTTP terminate; raw tunnels plaintext.
@@ -170,6 +181,7 @@ impl TerminateCtx {
             backend,
             headers: b.headers,
             http_rules,
+            http2: b.http2 && b.mode == crate::config::Mode::Terminate,
             resolver,
             cert_path: tls.cert.clone(),
             key_path: tls.key.clone(),
@@ -230,13 +242,16 @@ fn mtime(p: &std::path::Path) -> Option<SystemTime> {
 /// Handle one terminate connection. `prefix` is the ClientHello bytes already
 /// read off the socket (replayed into the TLS handshake); `backend` is an
 /// already-connected TCP stream (so pool retry/health lives in one place).
-pub async fn handle(
+/// `dialer` supplies fresh backend connections for the HTTP/2 gateway (which
+/// needs one per multiplexed stream); it is unused on the HTTP/1.1 path.
+pub async fn handle<D: BackendDial>(
     prefix: Vec<u8>,
     client: TcpStream,
     peer: SocketAddr,
     sni: &str,
     backend: TcpStream,
     ctx: &TerminateCtx,
+    dialer: D,
 ) -> io::Result<()> {
     let io = PrefixedReadIo::new(client, Cursor::new(prefix));
     let tls = ctx
@@ -244,6 +259,15 @@ pub async fn handle(
         .accept(io)
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls accept: {e}")))?;
+
+    // ALPN h2 (advertised only when the backend opted in): run the h2->HTTP/1.1
+    // gateway. The pre-connected `backend` is unused here — h2 multiplexes, so
+    // each stream dials its own backend connection.
+    if ctx.http2 && tls.alpn_protocol().as_deref() == Some(&b"h2"[..]) {
+        drop(backend);
+        let rules = Arc::new(ctx.http_rules.clone());
+        return h2_gateway(tls, dialer, ctx.headers, rules, peer).await;
+    }
 
     match &ctx.backend {
         None => http_forward(Buf::new(tls), Buf::new(backend), peer, &ctx.headers, &ctx.http_rules).await,
@@ -788,6 +812,387 @@ where
         discard_n(src, size).await?;
         let _ = src.read_line().await?; // trailing CRLF
     }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 termination (h2 -> HTTP/1.1 gateway)
+// ---------------------------------------------------------------------------
+
+/// Supplies fresh backend TCP connections for the HTTP/2 gateway — one per
+/// multiplexed stream. Implemented by `server` (which owns pool/retry/health).
+pub trait BackendDial: Clone + 'static {
+    fn dial(&self) -> impl std::future::Future<Output = io::Result<TcpStream>>;
+}
+
+/// Drive an h2 connection: accept streams and gateway each to HTTP/1.1. Each
+/// stream runs as its own task; the accept loop keeps driving the connection
+/// (that is what flushes the spawned streams' frames), per the monoio-http
+/// server pattern.
+///
+/// Limitations (documented): backends are spoken to over HTTP/1.1 plaintext
+/// (no re-encrypt), and server push / trailers are not forwarded.
+async fn h2_gateway<T, D>(
+    tls: T,
+    dialer: D,
+    headers: Headers,
+    rules: Arc<Vec<HttpRule>>,
+    peer: SocketAddr,
+) -> io::Result<()>
+where
+    T: AsyncReadRent + AsyncWriteRent + Unpin + 'static,
+    D: BackendDial,
+{
+    let mut conn = h2server::handshake(tls)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {e}")))?;
+    while let Some(result) = conn.accept().await {
+        let (request, respond) = match result {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let dialer = dialer.clone();
+        let rules = rules.clone();
+        monoio::spawn(async move {
+            if let Err(e) = h2_stream(request, respond, dialer, headers, rules, peer).await {
+                tracing::debug!(error = %e, "h2 stream error");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Request-body framing chosen when forwarding to the HTTP/1.1 backend.
+enum ReqBody {
+    None,
+    Length(usize),
+    Chunked,
+}
+
+async fn h2_stream<D: BackendDial>(
+    mut request: Request<RecvStream>,
+    mut respond: h2server::SendResponse<Bytes>,
+    dialer: D,
+    headers: Headers,
+    rules: Arc<Vec<HttpRule>>,
+    peer: SocketAddr,
+) -> io::Result<()> {
+    let path = request.uri().path().to_string();
+
+    // Direct-response path rule: answer without touching a backend.
+    if let Some(rule) = match_rule(&rules, &path) {
+        if rule.action == HttpAction::Respond {
+            drain_h2_body(request.body_mut()).await;
+            let status = rule.status.unwrap_or(200);
+            let ctype = rule.content_type.as_deref().unwrap_or("text/plain");
+            let body = Bytes::from(rule.body.clone().into_bytes());
+            let resp = Response::builder()
+                .status(status)
+                .header("content-type", ctype)
+                .body(())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let mut send = respond.send_response(resp, body.is_empty()).map_err(h2_io)?;
+            if !body.is_empty() {
+                send.send_data(body, true).map_err(h2_io)?;
+            }
+            return Ok(());
+        }
+    }
+
+    // Forward to an HTTP/1.1 backend (fresh connection per stream).
+    let framing = req_body_framing(&request);
+    let backend = dialer.dial().await?;
+    let mut backend = Buf::new(backend);
+    let head = build_h1_request_head(&request, peer, &headers, &framing);
+    backend.write_all(head).await?;
+    forward_h2_body_to_h1(request.body_mut(), &mut backend, &framing).await?;
+
+    // Response back to the client as h2.
+    let rhead = match backend.read_head().await? {
+        Some(h) => h,
+        None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "backend closed early")),
+    };
+    let (resp, body) = h1_head_to_h2_response(&rhead)?;
+    let end = matches!(body, Body::None);
+    let mut send = respond.send_response(resp, end).map_err(h2_io)?;
+    match body {
+        Body::None => {}
+        Body::Length(n) => h1_len_to_h2(&mut backend, &mut send, n).await?,
+        Body::Chunked => h1_chunked_to_h2(&mut backend, &mut send).await?,
+        Body::UntilEof => h1_eof_to_h2(&mut backend, &mut send).await?,
+    }
+    Ok(())
+}
+
+fn req_body_framing(request: &Request<RecvStream>) -> ReqBody {
+    if request.body().is_end_stream() {
+        return ReqBody::None;
+    }
+    match request
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        Some(n) => ReqBody::Length(n),
+        None => ReqBody::Chunked,
+    }
+}
+
+/// Build the HTTP/1.1 request head from the h2 request, injecting the configured
+/// forwarding headers (mirrors `rewrite_request` but reads an `http::HeaderMap`).
+fn build_h1_request_head(
+    request: &Request<RecvStream>,
+    peer: SocketAddr,
+    cfg: &Headers,
+    framing: &ReqBody,
+) -> Vec<u8> {
+    let method = request.method().as_str();
+    let target = request.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(format!("{method} {target} HTTP/1.1\r\n").as_bytes());
+
+    // Host from :authority (h2) or an explicit host header.
+    let host = request
+        .uri()
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| {
+            request
+                .headers()
+                .get(http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+    out.extend_from_slice(format!("Host: {host}\r\n").as_bytes());
+
+    let mut existing_xff: Option<String> = None;
+    for (name, value) in request.headers() {
+        let n = name.as_str();
+        if matches!(
+            n,
+            "host" | "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding"
+                | "te" | "upgrade" | "content-length"
+        ) {
+            continue; // hop-by-hop / framing headers are re-derived
+        }
+        if cfg.x_real_ip && n == "x-real-ip" {
+            continue;
+        }
+        if cfg.x_forwarded_proto && n == "x-forwarded-proto" {
+            continue;
+        }
+        if cfg.x_forwarded_for && n == "x-forwarded-for" {
+            existing_xff = value.to_str().ok().map(|s| s.to_string());
+            continue;
+        }
+        out.extend_from_slice(n.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    match framing {
+        ReqBody::None => {}
+        ReqBody::Length(n) => out.extend_from_slice(format!("Content-Length: {n}\r\n").as_bytes()),
+        ReqBody::Chunked => out.extend_from_slice(b"Transfer-Encoding: chunked\r\n"),
+    }
+
+    let ip = peer.ip();
+    if cfg.x_real_ip {
+        out.extend_from_slice(format!("X-Real-IP: {ip}\r\n").as_bytes());
+    }
+    if cfg.x_forwarded_proto {
+        out.extend_from_slice(b"X-Forwarded-Proto: https\r\n");
+    }
+    if cfg.x_forwarded_for {
+        let xff = match existing_xff {
+            Some(prev) => format!("{prev}, {ip}"),
+            None => ip.to_string(),
+        };
+        out.extend_from_slice(format!("X-Forwarded-For: {xff}\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+async fn drain_h2_body(body: &mut RecvStream) {
+    while let Some(chunk) = body.data().await {
+        match chunk {
+            Ok(data) => {
+                let _ = body.flow_control().release_capacity(data.len());
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Forward the h2 request body to the HTTP/1.1 backend using `framing`.
+async fn forward_h2_body_to_h1<S>(
+    body: &mut RecvStream,
+    backend: &mut Buf<S>,
+    framing: &ReqBody,
+) -> io::Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent,
+{
+    match framing {
+        ReqBody::None => Ok(()),
+        ReqBody::Length(_) => {
+            while let Some(chunk) = body.data().await {
+                let data = chunk.map_err(h2_io)?;
+                let _ = body.flow_control().release_capacity(data.len());
+                backend.write_all(data.to_vec()).await?;
+            }
+            Ok(())
+        }
+        ReqBody::Chunked => {
+            while let Some(chunk) = body.data().await {
+                let data = chunk.map_err(h2_io)?;
+                let _ = body.flow_control().release_capacity(data.len());
+                if data.is_empty() {
+                    continue;
+                }
+                backend.write_all(format!("{:x}\r\n", data.len()).into_bytes()).await?;
+                backend.write_all(data.to_vec()).await?;
+                backend.write_all(b"\r\n".to_vec()).await?;
+            }
+            backend.write_all(b"0\r\n\r\n".to_vec()).await?;
+            Ok(())
+        }
+    }
+}
+
+/// Parse the HTTP/1.1 response head into an h2 `Response<()>` plus body framing.
+fn h1_head_to_h2_response(head: &[u8]) -> io::Result<(Response<()>, Body)> {
+    let status = status_of(head).unwrap_or(502);
+    let mut builder = Response::builder().status(status);
+    let text = String::from_utf8_lossy(head);
+    for (i, line) in text.split("\r\n").enumerate() {
+        if i == 0 || line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            let n = name.trim().to_ascii_lowercase();
+            if matches!(
+                n.as_str(),
+                "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding"
+                    | "upgrade" | "content-length"
+            ) {
+                continue; // h2 forbids hop-by-hop / connection-specific headers
+            }
+            builder = builder.header(n, value.trim());
+        }
+    }
+    let framing = body_len(head, false, false)?;
+    let resp = builder
+        .body(())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    Ok((resp, framing))
+}
+
+async fn h1_len_to_h2<S>(
+    backend: &mut Buf<S>,
+    send: &mut SendStream<Bytes>,
+    mut n: usize,
+) -> io::Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent,
+{
+    if n == 0 {
+        return h2_send(send, Bytes::new(), true).await;
+    }
+    while n > 0 {
+        if backend.data.is_empty() && !backend.fill().await? {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in response body"));
+        }
+        let take = n.min(backend.data.len());
+        let chunk: Vec<u8> = backend.data.drain(..take).collect();
+        n -= take;
+        h2_send(send, Bytes::from(chunk), n == 0).await?;
+    }
+    Ok(())
+}
+
+async fn h1_chunked_to_h2<S>(backend: &mut Buf<S>, send: &mut SendStream<Bytes>) -> io::Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent,
+{
+    loop {
+        let line = backend.read_line().await?;
+        let hex = line.split(|&b| b == b';' || b == b'\r').next().unwrap_or(&[]);
+        let mut size = usize::from_str_radix(std::str::from_utf8(hex).unwrap_or("x").trim(), 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+        if size == 0 {
+            loop {
+                let l = backend.read_line().await?;
+                if l == b"\r\n" {
+                    break;
+                }
+            }
+            return h2_send(send, Bytes::new(), true).await;
+        }
+        while size > 0 {
+            if backend.data.is_empty() && !backend.fill().await? {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in chunk"));
+            }
+            let take = size.min(backend.data.len());
+            let chunk: Vec<u8> = backend.data.drain(..take).collect();
+            size -= take;
+            h2_send(send, Bytes::from(chunk), false).await?;
+        }
+        let _ = backend.read_line().await?; // trailing CRLF
+    }
+}
+
+async fn h1_eof_to_h2<S>(backend: &mut Buf<S>, send: &mut SendStream<Bytes>) -> io::Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent,
+{
+    loop {
+        if !backend.data.is_empty() {
+            let chunk = std::mem::take(&mut backend.data);
+            h2_send(send, Bytes::from(chunk), false).await?;
+        }
+        if !backend.fill().await? {
+            return h2_send(send, Bytes::new(), true).await;
+        }
+    }
+}
+
+/// Send `data` on an h2 stream, respecting flow-control capacity. `end` marks
+/// the last frame.
+async fn h2_send(send: &mut SendStream<Bytes>, data: Bytes, end: bool) -> io::Result<()> {
+    if data.is_empty() {
+        if end {
+            send.send_data(Bytes::new(), true).map_err(h2_io)?;
+        }
+        return Ok(());
+    }
+    let mut data = data;
+    while !data.is_empty() {
+        send.reserve_capacity(data.len());
+        let cap = await_capacity(send).await?;
+        if cap == 0 {
+            continue;
+        }
+        let take = cap.min(data.len());
+        let chunk = data.split_to(take);
+        let last = end && data.is_empty();
+        send.send_data(chunk, last).map_err(h2_io)?;
+    }
+    Ok(())
+}
+
+async fn await_capacity(send: &mut SendStream<Bytes>) -> io::Result<usize> {
+    std::future::poll_fn(|cx| send.poll_capacity(cx))
+        .await
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "h2 stream reset"))?
+        .map_err(h2_io)
+}
+
+fn h2_io(e: monoio_http::h2::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, format!("h2: {e}"))
 }
 
 // ---------------------------------------------------------------------------

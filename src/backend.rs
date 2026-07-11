@@ -147,6 +147,7 @@ mod tests {
             tls: None,
             backend_tls: None,
             headers: Default::default(),
+            http2: false,
             http_rules: Vec::new(),
             servers: servers.iter().map(|s| s.to_string()).collect(),
         }

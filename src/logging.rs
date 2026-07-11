@@ -6,6 +6,7 @@
 //! process-wide level is all this service needs.
 
 use crate::config::{Log, LogFormat};
+use std::io::IsTerminal;
 use tracing::Level;
 
 /// Install the global tracing subscriber. Call once at startup (run mode only).
@@ -16,7 +17,10 @@ pub fn init(cfg: &Log) {
         .or_else(|| parse_level(&cfg.level))
         .unwrap_or(Level::INFO);
 
-    let builder = tracing_subscriber::fmt().with_max_level(level);
+    // Color only when stderr is a real terminal, so logs redirected to a file
+    // or journald stay free of ANSI escapes.
+    let ansi = std::io::stderr().is_terminal();
+    let builder = tracing_subscriber::fmt().with_max_level(level).with_ansi(ansi);
     match cfg.format {
         LogFormat::Text => builder.init(),
         LogFormat::Json => builder.json().init(),

@@ -275,6 +275,43 @@ impl Drop for ActiveGuard {
     }
 }
 
+/// Per-stream backend connector for the HTTP/2 gateway. Owns the shared state
+/// (not a borrow) so each spawned stream task can hold and clone it. Looks the
+/// pool up by name each time so a SIGHUP reload is picked up.
+#[derive(Clone)]
+struct Dialer {
+    shared: Arc<Shared>,
+    backend: String,
+    connect_timeout: Duration,
+}
+
+impl crate::terminate::BackendDial for Dialer {
+    async fn dial(&self) -> io::Result<TcpStream> {
+        let st = self.shared.state.load_full();
+        let pool = st
+            .pools
+            .get(&self.backend)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "backend removed on reload"))?;
+        let mut tried: Vec<usize> = Vec::new();
+        loop {
+            let cand = pool.pick_candidate(&tried).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "no backend server available")
+            })?;
+            tried.push(cand);
+            match monoio::time::timeout(self.connect_timeout, TcpStream::connect(pool.addr(cand)))
+                .await
+            {
+                Ok(Ok(s)) => return Ok(s),
+                _ => {
+                    if pool.health_check() {
+                        pool.set_healthy(cand, false);
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn handle_tcp(
     mut client: TcpStream,
     peer: SocketAddr,
@@ -412,8 +449,17 @@ async fn handle_tcp(
     let _active = ActiveGuard::new(bm.clone());
 
     if pool.mode == Mode::Terminate {
+        // Dialer for the h2 gateway: reconnects per multiplexed stream (unused
+        // on the HTTP/1.1 path, which uses the pre-connected `backend_tcp`).
+        let dialer = Dialer {
+            shared: shared.clone(),
+            backend: backend_name.to_string(),
+            connect_timeout,
+        };
         let res = match shared.terminate.get(backend_name) {
-            Some(ctx) => crate::terminate::handle(buf, client, peer, &sni, backend_tcp, ctx).await,
+            Some(ctx) => {
+                crate::terminate::handle(buf, client, peer, &sni, backend_tcp, ctx, dialer).await
+            }
             None => Ok(()), // TLS context failed to build at startup — drop
         };
         if res.is_err() {

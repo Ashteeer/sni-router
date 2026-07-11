@@ -67,6 +67,8 @@ backends:
   #     # insecure_skip_verify: true    #   skip verification (test only)
   #     # client_cert: "/etc/.../client.pem"   # mTLS to the backend
   #     # client_key:  "/etc/.../client.key"
+  #   http2: true                       # advertise & terminate h2 (gatewayed to
+  #                                     #   the backend over HTTP/1.1; not with backend_tls)
   #   headers:
   #     x_real_ip: true
   #     x_forwarded_for: true
