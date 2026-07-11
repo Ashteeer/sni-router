@@ -25,6 +25,22 @@ pub struct Config {
     pub timeouts: Timeouts,
     #[serde(default)]
     pub limits: Limits,
+    /// Optional read-only admin/REST API (foundation for a future web UI).
+    #[serde(default)]
+    pub admin: Option<Admin>,
+}
+
+/// Admin HTTP API. Read-only: `GET /status`, `GET /config`, `GET /healthz`.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Admin {
+    /// Address to serve the admin API on, e.g. `127.0.0.1:9000`. Keep it on a
+    /// loopback / trusted interface.
+    pub bind: String,
+    /// Optional bearer token; when set, requests must send
+    /// `Authorization: Bearer <token>`. Never echoed back by `GET /config`.
+    #[serde(default, skip_serializing)]
+    pub token: Option<String>,
 }
 
 /// A listener only decides how client connections are accepted (`bind`, `proto`).

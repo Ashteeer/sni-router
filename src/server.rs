@@ -41,6 +41,8 @@ pub struct Shared {
     pub acls: Vec<Option<crate::acl::Acl>>,
     /// TLS contexts for terminate backends, keyed by backend name.
     pub terminate: HashMap<String, crate::terminate::TerminateCtx>,
+    /// Process start time, for the admin API's uptime.
+    pub started: Instant,
 }
 
 /// Run the router until killed. Blocks the calling thread.
@@ -57,7 +59,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         .map(|l| l.acl.as_ref().and_then(|a| crate::acl::Acl::compile(a).ok()))
         .collect();
     let terminate = crate::terminate::TerminateCtx::build_all(&cfg.backends);
-    let shared = Arc::new(Shared { cfg, pools, acls, terminate });
+    let shared = Arc::new(Shared { cfg, pools, acls, terminate, started: Instant::now() });
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     eprintln!(
@@ -96,6 +98,21 @@ fn worker(core: usize, shared: Arc<Shared>) {
 
     rt.block_on(async move {
         let mut tasks = Vec::new();
+
+        // Admin API: a single control-plane listener, only on core 0.
+        if core == 0 {
+            if let Some(admin) = &shared.cfg.admin {
+                match TcpListener::bind(admin.bind.as_str()) {
+                    Ok(l) => {
+                        eprintln!("sni-router: admin API on {}", admin.bind);
+                        let sh = shared.clone();
+                        tasks.push(monoio::spawn(crate::admin::serve(l, sh)));
+                    }
+                    Err(e) => eprintln!("core 0: admin bind {}: {e}", admin.bind),
+                }
+            }
+        }
+
         for (idx, l) in shared.cfg.listeners.iter().enumerate() {
             for bind in &l.bind {
                 let addr: SocketAddr = match bind.parse() {

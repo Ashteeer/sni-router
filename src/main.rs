@@ -1,4 +1,5 @@
 mod acl;
+mod admin;
 mod backend;
 mod config;
 mod protocol;

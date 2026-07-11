@@ -265,6 +265,16 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         }
     }
 
+    // Admin API bind address.
+    if let Some(admin) = &cfg.admin {
+        if admin.bind.parse::<SocketAddr>().is_err() {
+            d.push(Diagnostic::error(
+                "admin.bind",
+                format!("invalid address \"{}\" — expected IP:port", admin.bind),
+            ));
+        }
+    }
+
     // Limits.
     if cfg.limits.max_client_hello < 512 {
         d.push(Diagnostic::error(
