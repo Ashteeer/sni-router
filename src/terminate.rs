@@ -8,14 +8,21 @@
 //! yet — those need full-duplex splitting; add when a use case appears.
 
 use crate::config::{Backend, Headers};
+use arc_swap::ArcSwap;
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, PrefixedReadIo};
 use monoio::net::TcpStream;
 use monoio_rustls::{TlsAcceptor, TlsConnector};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::io::{self, Cursor};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+const CERT_POLL: Duration = Duration::from_secs(5);
 
 const HEAD_MAX: usize = 64 * 1024;
 const IO_CHUNK: usize = 16 * 1024;
@@ -26,6 +33,36 @@ pub struct TerminateCtx {
     /// `Some` => re-encrypt to the backend over TLS.
     backend: Option<BackendConnector>,
     headers: Headers,
+    /// Live-swappable cert (updated by the reload watcher).
+    resolver: Arc<SwapResolver>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+}
+
+/// rustls cert resolver whose certificate can be swapped atomically at runtime,
+/// so certbot/lego renewals are picked up with zero downtime.
+struct SwapResolver {
+    cert: ArcSwap<CertifiedKey>,
+}
+
+impl std::fmt::Debug for SwapResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SwapResolver")
+    }
+}
+
+impl ResolvesServerCert for SwapResolver {
+    fn resolve(&self, _hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        Some(self.cert.load_full())
+    }
+}
+
+/// One cert file to watch for changes.
+pub struct CertWatch {
+    resolver: Arc<SwapResolver>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    cert: PathBuf,
+    key: PathBuf,
 }
 
 struct BackendConnector {
@@ -34,35 +71,44 @@ struct BackendConnector {
 }
 
 impl TerminateCtx {
-    /// Build the TLS contexts for every terminate backend. Returns
-    /// `(name -> ctx)`; backends that fail to build are reported and skipped.
-    pub fn build_all(backends: &std::collections::BTreeMap<String, Backend>) -> HashMapCtx {
+    /// Build the TLS contexts for every terminate backend. Returns the map
+    /// plus the list of cert files to watch for renewal; backends that fail to
+    /// build are reported and skipped.
+    pub fn build_all(
+        backends: &std::collections::BTreeMap<String, Backend>,
+    ) -> (HashMapCtx, Vec<CertWatch>) {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut out = std::collections::HashMap::new();
+        let mut watch = Vec::new();
         for (name, b) in backends {
             if b.mode != crate::config::Mode::Terminate {
                 continue;
             }
             match Self::build_one(b, &provider) {
                 Ok(ctx) => {
+                    watch.push(CertWatch {
+                        resolver: ctx.resolver.clone(),
+                        provider: provider.clone(),
+                        cert: ctx.cert_path.clone(),
+                        key: ctx.key_path.clone(),
+                    });
                     out.insert(name.clone(), ctx);
                 }
                 Err(e) => eprintln!("backend {name}: terminate TLS setup failed: {e}"),
             }
         }
-        out
+        (out, watch)
     }
 
     fn build_one(b: &Backend, provider: &Arc<rustls::crypto::CryptoProvider>) -> Result<Self, String> {
         let tls = b.tls.as_ref().ok_or("terminate backend missing tls")?;
-        let certs = load_certs(&tls.cert)?;
-        let key = load_key(&tls.key)?;
+        let ck = build_certified_key(&tls.cert, &tls.key, provider)?;
+        let resolver = Arc::new(SwapResolver { cert: ArcSwap::new(ck) });
         let mut server = ServerConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(|e| e.to_string())?
             .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| e.to_string())?;
+            .with_cert_resolver(resolver.clone());
         server.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         let backend = match &b.backend_tls {
@@ -104,11 +150,62 @@ impl TerminateCtx {
             acceptor: TlsAcceptor::from(Arc::new(server)),
             backend,
             headers: b.headers,
+            resolver,
+            cert_path: tls.cert.clone(),
+            key_path: tls.key.clone(),
         })
     }
 }
 
 type HashMapCtx = std::collections::HashMap<String, TerminateCtx>;
+
+fn build_certified_key(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<CertifiedKey>, String> {
+    let certs = load_certs(cert)?;
+    let key = load_key(key)?;
+    let signing = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|e| e.to_string())?;
+    Ok(Arc::new(CertifiedKey::new(certs, signing)))
+}
+
+/// Watch terminate cert files and hot-swap the cert when they change (e.g. after
+/// a certbot/lego renewal), with zero downtime. Runs on a dedicated system
+/// thread — off the monoio data path.
+pub fn spawn_cert_watcher(watch: Vec<CertWatch>) {
+    if watch.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut mtimes: Vec<Option<SystemTime>> = watch.iter().map(|w| mtime(&w.cert)).collect();
+        loop {
+            std::thread::sleep(CERT_POLL);
+            for (i, w) in watch.iter().enumerate() {
+                let m = mtime(&w.cert);
+                if m.is_some() && m != mtimes[i] {
+                    match build_certified_key(&w.cert, &w.key, &w.provider) {
+                        Ok(ck) => {
+                            w.resolver.cert.store(ck);
+                            mtimes[i] = m;
+                            eprintln!("sni-router: reloaded certificate {}", w.cert.display());
+                        }
+                        Err(e) => {
+                            eprintln!("sni-router: cert reload {} failed: {e}", w.cert.display())
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn mtime(p: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
 
 /// Handle one terminate connection: `prefix` is the ClientHello bytes already
 /// read off the socket; they are replayed into the TLS handshake.

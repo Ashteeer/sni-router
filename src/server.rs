@@ -58,7 +58,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         .iter()
         .map(|l| l.acl.as_ref().and_then(|a| crate::acl::Acl::compile(a).ok()))
         .collect();
-    let terminate = crate::terminate::TerminateCtx::build_all(&cfg.backends);
+    let (terminate, cert_watch) = crate::terminate::TerminateCtx::build_all(&cfg.backends);
+    crate::terminate::spawn_cert_watcher(cert_watch);
     let shared = Arc::new(Shared { cfg, pools, acls, terminate, started: Instant::now() });
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
@@ -322,6 +323,14 @@ struct Flow {
 
 /// One UDP accept socket. QUIC 4-tuples are pinned to this socket by the
 /// reuseport hash, so a per-socket (single-thread) flow table is race-free.
+///
+/// Known limitation — QUIC connection migration: flows are keyed by the client
+/// 4-tuple. When a client migrates networks it switches to a fresh Connection
+/// ID delivered inside encrypted 1-RTT NEW_CONNECTION_ID frames, which an L4
+/// passthrough proxy (that never has the server's keys) cannot decrypt or
+/// correlate. Correct handling requires cooperative CID routing on the backend
+/// (QUIC-LB, RFC 9000 §5.1 / draft-ietf-quic-load-balancers); until then a
+/// migrated connection lands as a new flow and re-handshakes.
 async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, shared: Arc<Shared>) {
     let sock = Rc::new(sock);
     let mut flows: HashMap<SocketAddr, Flow> = HashMap::new();

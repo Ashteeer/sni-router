@@ -67,6 +67,31 @@ so a broken config never reaches a running instance:
 sni-router -t && sudo systemctl reload sni-router
 ```
 
+## TLS certificates with Let's Encrypt (terminate mode)
+
+sni-router does not embed an ACME client — it integrates with the mature ones
+(certbot / lego / acme.sh), the way HAProxy and nginx do. Point a terminate
+backend's `tls.cert` / `tls.key` at the files a tool like certbot manages:
+
+```yaml
+backends:
+  api:
+    mode: terminate
+    tls:
+      cert: "/etc/letsencrypt/live/api.example.com/fullchain.pem"
+      key:  "/etc/letsencrypt/live/api.example.com/privkey.pem"
+    servers: ["10.0.1.5:8080"]
+```
+
+Issue the certificate once, then let certbot renew on its timer:
+
+```bash
+sudo certbot certonly --standalone -d api.example.com
+```
+
+sni-router **watches the cert files and hot-swaps them with zero downtime**
+when they change — no restart or reload needed after a renewal.
+
 ## Running
 
 ```bash

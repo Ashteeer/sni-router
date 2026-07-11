@@ -26,11 +26,16 @@ Early development — **not production-ready yet**.
 | PROXY protocol v1/v2 (real client IP for backends) | done |
 | UDP/QUIC passthrough (SNI from the QUIC Initial packet) | done |
 | Backend pools: round-robin / least-conn | done |
+| TLS termination mode + `X-Forwarded-*` header injection | done |
+| Re-encrypt to TLS backends (`backend_tls`) + mTLS | done |
+| Access control (allow/deny by client IP CIDR and SNI) | done |
+| QUIC v2 (RFC 9369) Initial decryption | done |
+| Read-only admin/REST API (`/status`, `/config`, `/healthz`) | done |
+| Zero-downtime cert reload (certbot/lego renewals) | done |
 | Backend health checks (TCP connect probe) | planned |
 | Hot reload on SIGHUP (validate first, keep old config on failure) | planned |
 | Rate limiting, Prometheus metrics, access logs | planned |
 | Zero-copy `splice()` forwarding (currently buffered copy) | planned |
-| TLS termination mode (`mode: terminate`) | post-MVP |
 
 **Resilience to DPI-bypass clients (Zapret / GoodbyeDPI / byedpi):** the SNI
 parser never assumes the ClientHello arrives in one piece — it reassembles

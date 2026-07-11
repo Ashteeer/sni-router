@@ -30,6 +30,8 @@ monoio-rustls = "0.4"
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 httparse = "1"
+# Lock-free pointer swap for zero-downtime cert reload (and, later, config reload).
+arc-swap = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
