@@ -36,7 +36,14 @@ Early development — **not production-ready yet**.
 | Zero-copy `splice()` TCP forwarding | done |
 | WebSocket / HTTP Upgrade tunneling in terminate mode | done |
 | Hot reload on SIGHUP (validate first, keep old config on failure) | done |
-| Rate limiting, Prometheus metrics, access logs | planned |
+| Structured access logs + `tracing` (text/json) | done |
+| Prometheus metrics endpoint (`/metrics`, global + per-backend) | done |
+| Rate limiting (`max_conns_per_ip`) | done |
+| Graceful drain on SIGTERM | done |
+| `:80`→`:443` redirect (`mode: redirect_https`) | done |
+| Raw-TCP terminate for DoT etc. (`mode: terminate_tcp`) | done |
+| Per-path rules + synthetic `direct_response` in terminate | done |
+| HTTP/2 termination (`h2` ALPN → HTTP/1.1 backend gateway) | done |
 
 **Resilience to DPI-bypass clients (Zapret / GoodbyeDPI / byedpi):** the SNI
 parser never assumes the ClientHello arrives in one piece — it reassembles
@@ -84,7 +91,7 @@ listeners:
 
 backends:
   web_main:
-    mode: passthrough             # passthrough | terminate
+    mode: passthrough             # passthrough | terminate | terminate_tcp | redirect_https
     proxy_protocol: v2            # none | v1 | v2 — pass the real client IP
     balance: round_robin          # round_robin | least_conn
     servers:
