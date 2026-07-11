@@ -5,6 +5,7 @@ mod config;
 mod logging;
 mod metrics;
 mod protocol;
+mod redirect;
 mod router;
 mod server;
 mod terminate;

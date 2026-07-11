@@ -356,6 +356,30 @@ async fn handle_tcp(
         None => return Ok(()),
     };
 
+    // redirect_https answers directly (301 to https), no upstream connect.
+    if pool.mode == Mode::RedirectHttps {
+        let bm = metrics::backend(backend_name);
+        metrics::GLOBAL.conns_total.fetch_add(1, Ordering::Relaxed);
+        bm.conns_total.fetch_add(1, Ordering::Relaxed);
+        let res = crate::redirect::handle(&buf, &mut client).await;
+        let down = *res.as_ref().unwrap_or(&0);
+        metrics::GLOBAL.bytes_down.fetch_add(down, Ordering::Relaxed);
+        bm.bytes_down.fetch_add(down, Ordering::Relaxed);
+        if res.is_err() {
+            metrics::GLOBAL.conn_errors.fetch_add(1, Ordering::Relaxed);
+            bm.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        tracing::info!(
+            target: "access",
+            %peer,
+            backend = backend_name,
+            mode = "redirect",
+            duration_ms = start.elapsed().as_millis() as u64,
+            "connection closed"
+        );
+        return res.map(|_| ());
+    }
+
     let bm = metrics::backend(backend_name);
 
     // Connect with retry across the pool: on failure try the next server
@@ -408,6 +432,43 @@ async fn handle_tcp(
         return res;
     }
 
+    if pool.mode == Mode::TerminateTcp {
+        // Terminate TLS, then raw-tunnel to the backend (DoT etc.). Optional
+        // PROXY protocol is prepended to the backend stream.
+        let proxy_header = match pool.proxy_protocol {
+            ProxyProtocol::None => None,
+            ProxyProtocol::V1 => Some(proxy_protocol::v1(peer, local)),
+            ProxyProtocol::V2 => Some(proxy_protocol::v2(peer, local, false)),
+        };
+        let res = match shared.terminate.get(backend_name) {
+            Some(ctx) => {
+                crate::terminate::handle_raw(buf, client, backend_tcp, ctx, proxy_header).await
+            }
+            None => Ok((0, 0)), // TLS context failed to build at startup — drop
+        };
+        let (up, down) = *res.as_ref().unwrap_or(&(0, 0));
+        metrics::GLOBAL.bytes_up.fetch_add(up, Ordering::Relaxed);
+        metrics::GLOBAL.bytes_down.fetch_add(down, Ordering::Relaxed);
+        bm.bytes_up.fetch_add(up, Ordering::Relaxed);
+        bm.bytes_down.fetch_add(down, Ordering::Relaxed);
+        if res.is_err() {
+            metrics::GLOBAL.conn_errors.fetch_add(1, Ordering::Relaxed);
+            bm.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        tracing::info!(
+            target: "access",
+            %peer,
+            sni = sni_log(&sni),
+            backend = backend_name,
+            mode = "terminate_tcp",
+            bytes_up = up,
+            bytes_down = down,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "connection closed"
+        );
+        return res.map(|_| ());
+    }
+
     let mut upstream = backend_tcp;
     // PROXY protocol header carries the real client IP (the only way to pass it
     // in passthrough). `local` is what the client connected to on the router.
@@ -420,14 +481,15 @@ async fn handle_tcp(
         upstream.write_all(h).await.0?;
     }
     // Replay the buffered ClientHello verbatim, then hand both directions to the
-    // kernel via splice.
+    // kernel via splice. Those replayed bytes count toward client->backend too.
+    let hello_len = buf.len() as u64;
     upstream.write_all(buf).await.0?;
 
     let (cr, cw) = client.into_split();
     let (ur, uw) = upstream.into_split();
     let c2u = monoio::spawn(splice_dir(cr, uw)); // client -> backend
     let down = splice_dir(ur, cw).await; // backend -> client
-    let up = c2u.await;
+    let up = c2u.await + hello_len;
 
     metrics::GLOBAL.bytes_up.fetch_add(up, Ordering::Relaxed);
     metrics::GLOBAL.bytes_down.fetch_add(down, Ordering::Relaxed);

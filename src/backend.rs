@@ -29,7 +29,9 @@ impl Pool {
     pub fn from_backend(b: &Backend) -> Option<Pool> {
         let servers: Vec<SocketAddr> =
             b.servers.iter().filter_map(|s| s.parse().ok()).collect();
-        if servers.is_empty() {
+        // redirect_https answers directly and never picks a server, so an empty
+        // pool is valid for it; every other mode needs at least one server.
+        if servers.is_empty() && b.mode != Mode::RedirectHttps {
             return None;
         }
         let conns = servers.iter().map(|_| AtomicUsize::new(0)).collect();
@@ -145,6 +147,7 @@ mod tests {
             tls: None,
             backend_tls: None,
             headers: Default::default(),
+            http_rules: Vec::new(),
             servers: servers.iter().map(|s| s.to_string()).collect(),
         }
     }

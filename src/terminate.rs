@@ -4,10 +4,15 @@
 //!
 //! TCP only; QUIC/HTTP3 termination is out of scope. HTTP/1.1 is handled in a
 //! sequential request/response loop (which also copes with pipelining, since
-//! bodies are precisely framed). ponytail: no `Upgrade`/WebSocket in terminate
-//! yet — those need full-duplex splitting; add when a use case appears.
+//! bodies are precisely framed), with `Upgrade`/WebSocket switching to a raw
+//! full-duplex tunnel. Optional per-path rules answer some requests with a
+//! synthetic `direct_response` instead of forwarding.
+//!
+//! [`handle_raw`] is the sibling entry point for `mode: terminate_tcp`: it
+//! terminates TLS and forwards the decrypted stream to the backend as raw TCP
+//! (no HTTP parsing) — e.g. DoT on `:853`.
 
-use crate::config::{Backend, Headers};
+use crate::config::{Backend, Headers, HttpAction, HttpRule};
 use arc_swap::ArcSwap;
 use monoio::buf::IoBuf;
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, PrefixedReadIo, Split, Splitable};
@@ -34,6 +39,8 @@ pub struct TerminateCtx {
     /// `Some` => re-encrypt to the backend over TLS.
     backend: Option<BackendConnector>,
     headers: Headers,
+    /// Per-path request rules (terminate mode only; empty = forward all).
+    http_rules: Vec<crate::config::HttpRule>,
     /// Live-swappable cert (updated by the reload watcher).
     resolver: Arc<SwapResolver>,
     cert_path: PathBuf,
@@ -82,7 +89,7 @@ impl TerminateCtx {
         let mut out = std::collections::HashMap::new();
         let mut watch = Vec::new();
         for (name, b) in backends {
-            if b.mode != crate::config::Mode::Terminate {
+            if !matches!(b.mode, crate::config::Mode::Terminate | crate::config::Mode::TerminateTcp) {
                 continue;
             }
             match Self::build_one(b, &provider) {
@@ -110,11 +117,15 @@ impl TerminateCtx {
             .map_err(|e| e.to_string())?
             .with_no_client_auth()
             .with_cert_resolver(resolver.clone());
-        server.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // HTTP terminate advertises http/1.1; the raw (terminate_tcp) tunnel
+        // leaves ALPN unset so clients negotiating e.g. "dot" still connect.
+        if b.mode == crate::config::Mode::Terminate {
+            server.alpn_protocols = vec![b"http/1.1".to_vec()];
+        }
 
-        let backend = match &b.backend_tls {
-            None => None,
-            Some(bt) => {
+        // Re-encrypt / mTLS only applies to HTTP terminate; raw tunnels plaintext.
+        let backend = match (b.mode, &b.backend_tls) {
+            (crate::config::Mode::Terminate, Some(bt)) => {
                 let mut roots = RootCertStore::empty();
                 match &bt.ca {
                     Some(ca) => {
@@ -145,12 +156,20 @@ impl TerminateCtx {
                     sni: bt.sni.clone(),
                 })
             }
+            _ => None, // plaintext to backend (or raw mode)
+        };
+
+        let http_rules = if b.mode == crate::config::Mode::Terminate {
+            b.http_rules.clone()
+        } else {
+            Vec::new()
         };
 
         Ok(TerminateCtx {
             acceptor: TlsAcceptor::from(Arc::new(server)),
             backend,
             headers: b.headers,
+            http_rules,
             resolver,
             cert_path: tls.cert.clone(),
             key_path: tls.key.clone(),
@@ -227,7 +246,7 @@ pub async fn handle(
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls accept: {e}")))?;
 
     match &ctx.backend {
-        None => http_forward(Buf::new(tls), Buf::new(backend), peer, &ctx.headers).await,
+        None => http_forward(Buf::new(tls), Buf::new(backend), peer, &ctx.headers, &ctx.http_rules).await,
         Some(bc) => {
             let name = bc.sni.clone().unwrap_or_else(|| sni.to_string());
             let domain = ServerName::try_from(name)
@@ -237,9 +256,41 @@ pub async fn handle(
                 .connect(domain, backend)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("backend tls: {e}")))?;
-            http_forward(Buf::new(tls), Buf::new(btls), peer, &ctx.headers).await
+            http_forward(Buf::new(tls), Buf::new(btls), peer, &ctx.headers, &ctx.http_rules).await
         }
     }
+}
+
+/// `mode: terminate_tcp` — terminate the client's TLS, then forward the
+/// decrypted bytes to the backend as a **raw TCP tunnel** (no HTTP parsing).
+/// `prefix` is the ClientHello already read; `proxy_header` (optional PROXY
+/// protocol) is sent to the backend before the tunnel starts. Returns
+/// `(bytes_up, bytes_down)`.
+pub async fn handle_raw(
+    prefix: Vec<u8>,
+    client: TcpStream,
+    backend: TcpStream,
+    ctx: &TerminateCtx,
+    proxy_header: Option<Vec<u8>>,
+) -> io::Result<(u64, u64)> {
+    let io = PrefixedReadIo::new(client, Cursor::new(prefix));
+    let tls = ctx
+        .acceptor
+        .accept(io)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls accept: {e}")))?;
+
+    let mut backend = backend;
+    if let Some(h) = proxy_header {
+        backend.write_all(h).await.0?;
+    }
+
+    let (cr, cw) = Splitable::into_split(tls);
+    let (br, bw) = backend.into_split();
+    let c2b = monoio::spawn(tunnel_copy(cr, bw)); // client -> backend
+    let down = tunnel_copy(br, cw).await; // backend -> client
+    let up = c2b.await;
+    Ok((up, down))
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +434,7 @@ async fn http_forward<C, B>(
     mut backend: Buf<B>,
     peer: SocketAddr,
     headers: &Headers,
+    rules: &[HttpRule],
 ) -> io::Result<()>
 where
     C: AsyncReadRent + AsyncWriteRent + Split + 'static,
@@ -394,6 +446,18 @@ where
             Some(h) => h,
             None => return Ok(()), // client done
         };
+
+        // Path gating / direct_response: a matching `respond` rule answers the
+        // client directly (after draining its request body) without touching the
+        // backend. Non-matching requests (or `forward` rules) fall through.
+        if let Some(rule) = match_rule(rules, request_path(&head)) {
+            if rule.action == HttpAction::Respond {
+                skip_body(&mut client, &head).await?;
+                client.write_all(direct_response(rule)).await?;
+                continue;
+            }
+        }
+
         let (rewritten, req) = rewrite_request(&head, peer, headers)?;
         backend.write_all(rewritten).await?;
         match body_len(&head, true, false)? {
@@ -459,11 +523,13 @@ where
     Ok(())
 }
 
-async fn tunnel_copy<R, W>(mut r: R, mut w: W)
+/// Copy one direction until EOF, closing the write side. Returns bytes copied.
+async fn tunnel_copy<R, W>(mut r: R, mut w: W) -> u64
 where
     R: AsyncReadRent,
     W: AsyncWriteRent,
 {
+    let mut total = 0u64;
     let mut buf = vec![0u8; IO_CHUNK];
     loop {
         let (res, b) = r.read(buf).await;
@@ -473,6 +539,7 @@ where
             Ok(n) => n,
             Err(_) => break,
         };
+        total += n as u64;
         let (wres, slice) = w.write_all(buf.slice(..n)).await;
         buf = slice.into_inner();
         if wres.is_err() {
@@ -480,6 +547,7 @@ where
         }
     }
     let _ = w.shutdown().await;
+    total
 }
 
 enum Body {
@@ -601,6 +669,128 @@ fn rewrite_request(head: &[u8], peer: SocketAddr, cfg: &Headers) -> io::Result<(
 }
 
 // ---------------------------------------------------------------------------
+// path rules / direct_response
+// ---------------------------------------------------------------------------
+
+/// The request target from an HTTP head ("GET /path HTTP/1.1" -> "/path").
+fn request_path(head: &[u8]) -> &str {
+    let line = match head.split(|&b| b == b'\r' || b == b'\n').next() {
+        Some(l) => l,
+        None => return "",
+    };
+    std::str::from_utf8(line)
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1))
+        .unwrap_or("")
+}
+
+/// First rule whose path prefix (or `*`) matches; `None` = forward as usual.
+fn match_rule<'a>(rules: &'a [HttpRule], path: &str) -> Option<&'a HttpRule> {
+    rules
+        .iter()
+        .find(|r| r.path == "*" || path.starts_with(r.path.as_str()))
+}
+
+/// Render a synthetic `respond` rule into an HTTP/1.1 response (keep-alive, so
+/// the connection stays usable for the next request).
+fn direct_response(rule: &HttpRule) -> Vec<u8> {
+    let status = rule.status.unwrap_or(200);
+    let reason = reason_phrase(status);
+    let ctype = rule.content_type.as_deref().unwrap_or("text/plain");
+    let body = rule.body.as_bytes();
+    let mut out = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n\
+         Content-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(body);
+    out
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        410 => "Gone",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Status",
+    }
+}
+
+/// Read and discard a request body (so the next request head stays aligned when
+/// we answered this one with a direct response).
+async fn skip_body<S>(src: &mut Buf<S>, head: &[u8]) -> io::Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent,
+{
+    match body_len(head, true, false)? {
+        Body::None => Ok(()),
+        Body::Length(n) => discard_n(src, n).await,
+        Body::Chunked => discard_chunked(src).await,
+        Body::UntilEof => loop {
+            src.data.clear();
+            if !src.fill().await? {
+                return Ok(());
+            }
+        },
+    }
+}
+
+async fn discard_n<S>(src: &mut Buf<S>, mut n: usize) -> io::Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent,
+{
+    while n > 0 {
+        if src.data.is_empty() && !src.fill().await? {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in body"));
+        }
+        let take = n.min(src.data.len());
+        src.data.drain(..take);
+        n -= take;
+    }
+    Ok(())
+}
+
+async fn discard_chunked<S>(src: &mut Buf<S>) -> io::Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent,
+{
+    loop {
+        let line = src.read_line().await?;
+        let hex = line.split(|&b| b == b';' || b == b'\r').next().unwrap_or(&[]);
+        let size = usize::from_str_radix(std::str::from_utf8(hex).unwrap_or("x").trim(), 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+        if size == 0 {
+            loop {
+                let l = src.read_line().await?;
+                if l == b"\r\n" {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+        discard_n(src, size).await?;
+        let _ = src.read_line().await?; // trailing CRLF
+    }
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
@@ -670,5 +860,53 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(path: &str, action: HttpAction, status: Option<u16>) -> HttpRule {
+        HttpRule { path: path.into(), action, status, body: String::new(), content_type: None }
+    }
+
+    #[test]
+    fn request_path_extracts_target() {
+        assert_eq!(request_path(b"GET /dns-query?x=1 HTTP/1.1\r\nHost: a\r\n\r\n"), "/dns-query?x=1");
+        assert_eq!(request_path(b"POST / HTTP/1.1\r\n\r\n"), "/");
+        assert_eq!(request_path(b"garbage"), "");
+    }
+
+    #[test]
+    fn match_rule_prefix_and_catch_all() {
+        let rules = vec![
+            rule("/dns-query", HttpAction::Forward, None),
+            rule("*", HttpAction::Respond, Some(404)),
+        ];
+        // prefix match wins first
+        assert_eq!(match_rule(&rules, "/dns-query").unwrap().action, HttpAction::Forward);
+        // subpath still matches the prefix
+        assert_eq!(match_rule(&rules, "/dns-query/extra").unwrap().action, HttpAction::Forward);
+        // anything else falls to the catch-all responder
+        assert_eq!(match_rule(&rules, "/other").unwrap().action, HttpAction::Respond);
+        // no rules => forward everything (None)
+        assert!(match_rule(&[], "/anything").is_none());
+    }
+
+    #[test]
+    fn direct_response_is_well_framed() {
+        let r = HttpRule {
+            path: "*".into(),
+            action: HttpAction::Respond,
+            status: Some(404),
+            body: "nope\n".into(),
+            content_type: Some("application/json".into()),
+        };
+        let out = String::from_utf8(direct_response(&r)).unwrap();
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+        assert!(out.contains("Content-Type: application/json\r\n"), "{out}");
+        assert!(out.contains("Content-Length: 5\r\n"), "{out}");
+        assert!(out.ends_with("\r\n\r\nnope\n"), "{out}");
     }
 }

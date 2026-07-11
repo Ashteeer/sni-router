@@ -23,6 +23,22 @@ listeners:
       - sni: "*"                # catch-all (also catches clients without SNI)
         backend: default_pool
 
+  # Plain HTTP on :80 that 301-redirects everything to https:// (Envoy parity).
+  # - name: http_redirect
+  #   bind: ["0.0.0.0:80", "[::]:80"]
+  #   proto: tcp
+  #   routes:
+  #     - sni: "*"
+  #       backend: to_https
+
+  # DNS-over-TLS on :853: terminate TLS, hand the backend raw TCP DNS.
+  # - name: dot
+  #   bind: ["0.0.0.0:853"]
+  #   proto: tcp
+  #   routes:
+  #     - sni: "*"
+  #       backend: dot_backend
+
 backends:
   web_main:
     mode: passthrough           # passthrough | terminate — what THIS backend expects
@@ -58,6 +74,31 @@ backends:
   #   balance: least_conn
   #   servers:
   #     - "10.0.1.5:8080"
+  #   # Optional per-path rules (first match wins; no rules = forward everything).
+  #   # Envoy-style DoH: forward /dns-query, answer everything else with 404.
+  #   http_rules:
+  #     - path: "/dns-query"
+  #       action: forward
+  #     - path: "*"
+  #       action: respond
+  #       status: 404
+  #       body: "not found\n"
+  #       content_type: "text/plain"
+
+  # 301 http->https responder (no servers, no TLS — it serves plaintext :80):
+  # to_https:
+  #   mode: redirect_https
+
+  # DoT / raw-TCP terminate: strip TLS, forward raw bytes to a DNS-over-TCP
+  # server. Optional proxy_protocol passes the real client IP.
+  # dot_backend:
+  #   mode: terminate_tcp
+  #   proxy_protocol: none
+  #   tls:
+  #     cert: "/etc/sni-router/certs/dns.example.org.pem"
+  #     key: "/etc/sni-router/certs/dns.example.org.key"
+  #   servers:
+  #     - "10.0.2.5:53"
 
 # Global timeouts, seconds (defaults shown).
 timeouts:

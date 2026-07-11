@@ -145,6 +145,8 @@ fn mode_str(m: Mode) -> &'static str {
     match m {
         Mode::Passthrough => "passthrough",
         Mode::Terminate => "terminate",
+        Mode::TerminateTcp => "terminate_tcp",
+        Mode::RedirectHttps => "redirect_https",
     }
 }
 

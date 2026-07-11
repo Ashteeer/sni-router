@@ -5,7 +5,7 @@
 //! by the SIGHUP reload path: an invalid new config is rejected and the old
 //! one keeps running.
 
-use super::{Config, Mode, Proto};
+use super::{Config, HttpAction, Mode, Proto};
 use std::net::{IpAddr, SocketAddr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,14 +126,15 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                 Some(b) => {
                     // QUIC termination is post-MVP: udp listeners require
                     // passthrough backends.
-                    if l.proto == Proto::Udp && b.mode == Mode::Terminate {
+                    if l.proto == Proto::Udp && b.mode != Mode::Passthrough {
                         d.push(Diagnostic::error(
                             format!("{rp}.backend"),
                             format!(
-                                "backend \"{}\" has mode \"terminate\", which is not \
+                                "backend \"{}\" has mode \"{}\", which is not \
                                  supported for udp (QUIC) listeners — use a \
                                  passthrough backend",
-                                route.backend
+                                route.backend,
+                                mode_name(b.mode)
                             ),
                         ));
                     }
@@ -158,7 +159,8 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
     // Backends.
     for (name, b) in &cfg.backends {
         let bp = format!("backends.{name}");
-        if b.servers.is_empty() {
+        // Empty servers is only valid for redirect_https (no upstream).
+        if b.servers.is_empty() && b.mode != Mode::RedirectHttps {
             d.push(Diagnostic::error(
                 format!("{bp}.servers"),
                 "at least one server is required",
@@ -178,11 +180,15 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
             }
         }
         match b.mode {
-            Mode::Terminate => {
+            Mode::Terminate | Mode::TerminateTcp => {
+                // Both terminate modes present a TLS cert to clients.
                 match &b.tls {
                     None => d.push(Diagnostic::error(
                         format!("{bp}.tls"),
-                        "mode \"terminate\" requires a tls section with cert and key",
+                        format!(
+                            "mode \"{}\" requires a tls section with cert and key",
+                            mode_name(b.mode)
+                        ),
                     )),
                     Some(t) => {
                         for (field, p) in [("cert", &t.cert), ("key", &t.key)] {
@@ -195,25 +201,47 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                         }
                     }
                 }
-                if let Some(bt) = &b.backend_tls {
-                    for (field, p) in [
-                        ("ca", &bt.ca),
-                        ("client_cert", &bt.client_cert),
-                        ("client_key", &bt.client_key),
-                    ] {
-                        if let Some(path) = p {
-                            if let Err(e) = std::fs::File::open(path) {
-                                d.push(Diagnostic::error(
-                                    format!("{bp}.backend_tls.{field}"),
-                                    format!("cannot read \"{}\": {e}", path.display()),
-                                ));
+                if b.mode == Mode::Terminate {
+                    if let Some(bt) = &b.backend_tls {
+                        for (field, p) in [
+                            ("ca", &bt.ca),
+                            ("client_cert", &bt.client_cert),
+                            ("client_key", &bt.client_key),
+                        ] {
+                            if let Some(path) = p {
+                                if let Err(e) = std::fs::File::open(path) {
+                                    d.push(Diagnostic::error(
+                                        format!("{bp}.backend_tls.{field}"),
+                                        format!("cannot read \"{}\": {e}", path.display()),
+                                    ));
+                                }
                             }
                         }
+                        if bt.client_cert.is_some() != bt.client_key.is_some() {
+                            d.push(Diagnostic::error(
+                                format!("{bp}.backend_tls"),
+                                "mTLS requires both client_cert and client_key (or neither)",
+                            ));
+                        }
                     }
-                    if bt.client_cert.is_some() != bt.client_key.is_some() {
-                        d.push(Diagnostic::error(
+                } else {
+                    // terminate_tcp is a raw byte tunnel: HTTP-only knobs are ignored.
+                    if b.backend_tls.is_some() {
+                        d.push(Diagnostic::warning(
                             format!("{bp}.backend_tls"),
-                            "mTLS requires both client_cert and client_key (or neither)",
+                            "backend_tls is ignored in terminate_tcp (raw) mode",
+                        ));
+                    }
+                    if b.headers.any() {
+                        d.push(Diagnostic::warning(
+                            format!("{bp}.headers"),
+                            "headers are ignored in terminate_tcp (raw) mode",
+                        ));
+                    }
+                    if !b.http_rules.is_empty() {
+                        d.push(Diagnostic::warning(
+                            format!("{bp}.http_rules"),
+                            "http_rules are ignored in terminate_tcp (raw) mode",
                         ));
                     }
                 }
@@ -236,6 +264,63 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                         format!("{bp}.headers"),
                         "headers are only applied in terminate mode",
                     ));
+                }
+                if !b.http_rules.is_empty() {
+                    d.push(Diagnostic::warning(
+                        format!("{bp}.http_rules"),
+                        "http_rules are only applied in terminate mode",
+                    ));
+                }
+            }
+            Mode::RedirectHttps => {
+                if !b.servers.is_empty() {
+                    d.push(Diagnostic::warning(
+                        format!("{bp}.servers"),
+                        "servers are ignored in redirect_https mode (it sends a 301, no upstream)",
+                    ));
+                }
+                if b.tls.is_some() {
+                    d.push(Diagnostic::warning(
+                        format!("{bp}.tls"),
+                        "tls is ignored in redirect_https mode (it serves plaintext :80)",
+                    ));
+                }
+                if !b.http_rules.is_empty() {
+                    d.push(Diagnostic::warning(
+                        format!("{bp}.http_rules"),
+                        "http_rules are only applied in terminate mode",
+                    ));
+                }
+            }
+        }
+        // Validate http_rules content (applicability is warned per-mode above).
+        for (k, r) in b.http_rules.iter().enumerate() {
+            let rpth = format!("{bp}.http_rules[{k}]");
+            if r.path.is_empty() {
+                d.push(Diagnostic::error(
+                    format!("{rpth}.path"),
+                    "path must not be empty (use \"*\" for catch-all)",
+                ));
+            }
+            match r.action {
+                HttpAction::Respond => match r.status {
+                    None => d.push(Diagnostic::error(
+                        format!("{rpth}.status"),
+                        "action \"respond\" requires a status code",
+                    )),
+                    Some(s) if !(100..600).contains(&s) => d.push(Diagnostic::error(
+                        format!("{rpth}.status"),
+                        format!("status {s} out of range (100-599)"),
+                    )),
+                    _ => {}
+                },
+                HttpAction::Forward => {
+                    if r.status.is_some() {
+                        d.push(Diagnostic::warning(
+                            format!("{rpth}.status"),
+                            "status is ignored for action \"forward\"",
+                        ));
+                    }
                 }
             }
         }
@@ -312,6 +397,16 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
     }
 
     d
+}
+
+/// Human-readable mode name for diagnostics (matches the YAML spelling).
+fn mode_name(m: Mode) -> &'static str {
+    match m {
+        Mode::Passthrough => "passthrough",
+        Mode::Terminate => "terminate",
+        Mode::TerminateTcp => "terminate_tcp",
+        Mode::RedirectHttps => "redirect_https",
+    }
 }
 
 /// Does pattern `a` cover everything pattern `b` could match?
@@ -552,6 +647,59 @@ backends:
 "#));
         assert!(
             errors(&d).iter().any(|e| e.message.contains("not supported for udp")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_https_allows_empty_servers() {
+        let d = validate(&cfg(r#"
+listeners:
+  - name: r
+    bind: ["0.0.0.0:80"]
+    routes: [{ sni: "*", backend: to_https }]
+backends:
+  to_https:
+    mode: redirect_https
+"#));
+        assert!(errors(&d).is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn terminate_tcp_requires_tls() {
+        let d = validate(&cfg(r#"
+listeners:
+  - name: dot
+    bind: ["0.0.0.0:853"]
+    routes: [{ sni: "*", backend: dot }]
+backends:
+  dot:
+    mode: terminate_tcp
+    servers: ["10.0.0.1:53"]
+"#));
+        assert!(
+            errors(&d).iter().any(|e| e.message.contains("requires a tls section")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn http_rules_respond_needs_status() {
+        let d = validate(&cfg(r#"
+listeners:
+  - name: l
+    bind: ["0.0.0.0:443"]
+    routes: [{ sni: "*", backend: api }]
+backends:
+  api:
+    mode: terminate
+    tls: { cert: "/nonexistent/c.pem", key: "/nonexistent/k.pem" }
+    http_rules:
+      - { path: "*", action: respond }
+    servers: ["10.0.0.1:8080"]
+"#));
+        assert!(
+            errors(&d).iter().any(|e| e.message.contains("requires a status code")),
             "{d:?}"
         );
     }

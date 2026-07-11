@@ -157,17 +157,58 @@ pub struct Backend {
     /// Injected HTTP headers; only applied when `mode: terminate`.
     #[serde(default)]
     pub headers: Headers,
+    /// Optional per-path request rules (terminate mode only): forward matching
+    /// paths to the backend, answer others with a synthetic response. First
+    /// match wins; if empty, every request is forwarded. Envoy-style DoH:
+    /// `/dns-query` -> forward, `*` -> 404.
+    #[serde(default)]
+    pub http_rules: Vec<HttpRule>,
     /// Backend addresses, `IP:port`. Address family is independent from the
-    /// listener's (IPv6 client -> IPv4 backend works in passthrough).
+    /// listener's (IPv6 client -> IPv4 backend works in passthrough). Empty is
+    /// only valid for `mode: redirect_https`.
+    #[serde(default)]
     pub servers: Vec<String>,
 }
 
+/// One terminate-mode request rule, matched by URL path prefix.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRule {
+    /// Path prefix to match (`/dns-query`), or `*` for catch-all.
+    pub path: String,
+    pub action: HttpAction,
+    /// `respond` action: HTTP status code (required for `respond`).
+    pub status: Option<u16>,
+    /// `respond` action: optional response body.
+    #[serde(default)]
+    pub body: String,
+    /// `respond` action: `Content-Type` (default `text/plain`).
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpAction {
+    /// Forward the request to this backend's servers.
+    Forward,
+    /// Answer directly with a synthetic response (no backend involved).
+    Respond,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
     #[default]
     Passthrough,
+    /// Terminate TLS and forward to the backend as HTTP/1.1 (with header
+    /// injection, optional re-encrypt, and optional path rules).
     Terminate,
+    /// Terminate TLS and forward the decrypted stream to the backend as **raw
+    /// TCP** (not HTTP) — e.g. DoT on `:853`. Optional PROXY protocol.
+    TerminateTcp,
+    /// Answer plaintext HTTP with a `301` to the `https://` equivalent. No
+    /// backend servers; intended for a `:80` listener.
+    RedirectHttps,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
