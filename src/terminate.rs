@@ -471,13 +471,14 @@ where
             None => return Ok(()), // client done
         };
 
-        // Path gating / direct_response: a matching `respond` rule answers the
-        // client directly (after draining its request body) without touching the
+        // Path rules: a matching `respond` or `redirect` rule answers the client
+        // directly (after draining its request body) without touching the
         // backend. Non-matching requests (or `forward` rules) fall through.
         if let Some(rule) = match_rule(rules, request_path(&head)) {
-            if rule.action == HttpAction::Respond {
+            if rule.action != HttpAction::Forward {
                 skip_body(&mut client, &head).await?;
-                client.write_all(direct_response(rule)).await?;
+                let resp = synthetic_response(rule, request_host(&head), request_path(&head), true);
+                client.write_all(resp).await?;
                 continue;
             }
         }
@@ -697,7 +698,7 @@ fn rewrite_request(head: &[u8], peer: SocketAddr, cfg: &Headers) -> io::Result<(
 // ---------------------------------------------------------------------------
 
 /// The request target from an HTTP head ("GET /path HTTP/1.1" -> "/path").
-fn request_path(head: &[u8]) -> &str {
+pub(crate) fn request_path(head: &[u8]) -> &str {
     let line = match head.split(|&b| b == b'\r' || b == b'\n').next() {
         Some(l) => l,
         None => return "",
@@ -708,23 +709,65 @@ fn request_path(head: &[u8]) -> &str {
         .unwrap_or("")
 }
 
+/// The `Host` header value from an HTTP head (empty if absent).
+pub(crate) fn request_host(head: &[u8]) -> &str {
+    std::str::from_utf8(head)
+        .ok()
+        .and_then(|text| {
+            text.split("\r\n").skip(1).find_map(|l| {
+                let (n, v) = l.split_once(':')?;
+                n.trim().eq_ignore_ascii_case("host").then(|| v.trim())
+            })
+        })
+        .unwrap_or("")
+}
+
 /// First rule whose path prefix (or `*`) matches; `None` = forward as usual.
-fn match_rule<'a>(rules: &'a [HttpRule], path: &str) -> Option<&'a HttpRule> {
+pub(crate) fn match_rule<'a>(rules: &'a [HttpRule], path: &str) -> Option<&'a HttpRule> {
     rules
         .iter()
         .find(|r| r.path == "*" || path.starts_with(r.path.as_str()))
 }
 
-/// Render a synthetic `respond` rule into an HTTP/1.1 response (keep-alive, so
-/// the connection stays usable for the next request).
-fn direct_response(rule: &HttpRule) -> Vec<u8> {
+/// Resolve a redirect `to` target: the literal `https` means "same host+path
+/// over https"; anything else is used verbatim (an absolute URL).
+pub(crate) fn redirect_location(to: &str, host: &str, path: &str) -> String {
+    if to == "https" {
+        format!("https://{host}{path}")
+    } else {
+        to.to_string()
+    }
+}
+
+/// Render a `respond` or `redirect` rule into an HTTP/1.1 response. `host`/`path`
+/// feed the dynamic `https` redirect target. `keep_alive` picks the `Connection`
+/// header: terminate pipelines (true); the plaintext responder answers once and
+/// closes (false). Shared with `redirect.rs`.
+pub(crate) fn synthetic_response(
+    rule: &HttpRule,
+    host: &str,
+    path: &str,
+    keep_alive: bool,
+) -> Vec<u8> {
+    let conn = if keep_alive { "keep-alive" } else { "close" };
+    if rule.action == HttpAction::Redirect {
+        let status = rule.status.unwrap_or(301);
+        let reason = reason_phrase(status);
+        let location = redirect_location(rule.to.as_deref().unwrap_or("https"), host, path);
+        return format!(
+            "HTTP/1.1 {status} {reason}\r\nLocation: {location}\r\n\
+             Content-Length: 0\r\nConnection: {conn}\r\n\r\n"
+        )
+        .into_bytes();
+    }
+    // respond
     let status = rule.status.unwrap_or(200);
     let reason = reason_phrase(status);
     let ctype = rule.content_type.as_deref().unwrap_or("text/plain");
     let body = rule.body.as_bytes();
     let mut out = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n\
-         Content-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+         Content-Length: {}\r\nConnection: {conn}\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -878,18 +921,12 @@ async fn h2_stream<D: BackendDial>(
 ) -> io::Result<()> {
     let path = request.uri().path().to_string();
 
-    // Direct-response path rule: answer without touching a backend.
+    // Path rule: `respond`/`redirect` answer without touching a backend.
     if let Some(rule) = match_rule(&rules, &path) {
-        if rule.action == HttpAction::Respond {
+        if rule.action != HttpAction::Forward {
             drain_h2_body(request.body_mut()).await;
-            let status = rule.status.unwrap_or(200);
-            let ctype = rule.content_type.as_deref().unwrap_or("text/plain");
-            let body = Bytes::from(rule.body.clone().into_bytes());
-            let resp = Response::builder()
-                .status(status)
-                .header("content-type", ctype)
-                .body(())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let host = request.uri().authority().map(|a| a.as_str()).unwrap_or("");
+            let (resp, body) = h2_synthetic(rule, host, &path)?;
             let mut send = respond.send_response(resp, body.is_empty()).map_err(h2_io)?;
             if !body.is_empty() {
                 send.send_data(body, true).map_err(h2_io)?;
@@ -921,6 +958,29 @@ async fn h2_stream<D: BackendDial>(
         Body::UntilEof => h1_eof_to_h2(&mut backend, &mut send).await?,
     }
     Ok(())
+}
+
+/// Build an h2 `respond`/`redirect` response (`Response<()>` head + body bytes).
+fn h2_synthetic(rule: &HttpRule, host: &str, path: &str) -> io::Result<(Response<()>, Bytes)> {
+    let build_err = |e: http::Error| io::Error::new(io::ErrorKind::Other, e.to_string());
+    if rule.action == HttpAction::Redirect {
+        let status = rule.status.unwrap_or(301);
+        let location = redirect_location(rule.to.as_deref().unwrap_or("https"), host, path);
+        let resp = Response::builder()
+            .status(status)
+            .header("location", location)
+            .body(())
+            .map_err(build_err)?;
+        return Ok((resp, Bytes::new()));
+    }
+    let status = rule.status.unwrap_or(200);
+    let ctype = rule.content_type.as_deref().unwrap_or("text/plain");
+    let resp = Response::builder()
+        .status(status)
+        .header("content-type", ctype)
+        .body(())
+        .map_err(build_err)?;
+    Ok((resp, Bytes::from(rule.body.clone().into_bytes())))
 }
 
 fn req_body_framing(request: &Request<RecvStream>) -> ReqBody {
@@ -1273,7 +1333,7 @@ mod tests {
     use super::*;
 
     fn rule(path: &str, action: HttpAction, status: Option<u16>) -> HttpRule {
-        HttpRule { path: path.into(), action, status, body: String::new(), content_type: None }
+        HttpRule { path: path.into(), action, status, body: String::new(), content_type: None, to: None }
     }
 
     #[test]
@@ -1300,18 +1360,49 @@ mod tests {
     }
 
     #[test]
-    fn direct_response_is_well_framed() {
+    fn respond_is_well_framed() {
         let r = HttpRule {
             path: "*".into(),
             action: HttpAction::Respond,
             status: Some(404),
             body: "nope\n".into(),
             content_type: Some("application/json".into()),
+            to: None,
         };
-        let out = String::from_utf8(direct_response(&r)).unwrap();
+        let out = String::from_utf8(synthetic_response(&r, "h", "/p", true)).unwrap();
         assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
         assert!(out.contains("Content-Type: application/json\r\n"), "{out}");
         assert!(out.contains("Content-Length: 5\r\n"), "{out}");
         assert!(out.ends_with("\r\n\r\nnope\n"), "{out}");
+    }
+
+    #[test]
+    fn redirect_to_https_uses_host_and_path() {
+        let r = HttpRule {
+            path: "*".into(),
+            action: HttpAction::Redirect,
+            status: None,
+            body: String::new(),
+            content_type: None,
+            to: Some("https".into()),
+        };
+        let out = String::from_utf8(synthetic_response(&r, "example.com", "/a?b=1", false)).unwrap();
+        assert!(out.starts_with("HTTP/1.1 301 Moved Permanently\r\n"), "{out}");
+        assert!(out.contains("Location: https://example.com/a?b=1\r\n"), "{out}");
+    }
+
+    #[test]
+    fn redirect_to_literal_url() {
+        let r = HttpRule {
+            path: "*".into(),
+            action: HttpAction::Redirect,
+            status: Some(302),
+            body: String::new(),
+            content_type: None,
+            to: Some("https://new.example.com/".into()),
+        };
+        let out = String::from_utf8(synthetic_response(&r, "old", "/x", false)).unwrap();
+        assert!(out.starts_with("HTTP/1.1 302 Found\r\n"), "{out}");
+        assert!(out.contains("Location: https://new.example.com/\r\n"), "{out}");
     }
 }

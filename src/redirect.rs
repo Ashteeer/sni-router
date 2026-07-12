@@ -1,17 +1,22 @@
-//! `mode: redirect_https` — answer plaintext HTTP (typically on `:80`) with a
-//! `301` to the `https://` equivalent. No backend, no TLS; a tiny stateless
-//! responder that reuses the bytes already buffered while probing for a SNI.
+//! `mode: redirect_https` — a small plaintext-HTTP responder (typically on
+//! `:80`). With no `http_rules` it 301-redirects every request to the `https://`
+//! equivalent (the common one-liner). With `http_rules` it applies them, so the
+//! same `respond` (e.g. 404) and `redirect` (e.g. 301) rules used in terminate
+//! backends also work here — synthetic responses are not tied to a port/mode.
+//!
+//! Answers one request per connection and closes (bodies are ignored), which is
+//! all a redirect/404 endpoint needs.
 
+use crate::config::{HttpAction, HttpRule};
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 use std::io;
 
 const HEAD_MAX: usize = 16 * 1024;
 
-/// Read the request head (continuing from `prefix`, the bytes already read off
-/// the socket), then reply with a redirect to the `https://` URL for the same
-/// Host and path. Returns the number of response bytes written.
-pub async fn handle(prefix: &[u8], client: &mut TcpStream) -> io::Result<u64> {
+/// Read the request head (continuing from `prefix`), pick a response per
+/// `rules`, write it, and close. Returns the number of response bytes written.
+pub async fn handle(prefix: &[u8], client: &mut TcpStream, rules: &[HttpRule]) -> io::Result<u64> {
     let mut buf = prefix.to_vec();
     while find(&buf, b"\r\n\r\n").is_none() && buf.len() < HEAD_MAX {
         let tmp = vec![0u8; 2048];
@@ -23,41 +28,54 @@ pub async fn handle(prefix: &[u8], client: &mut TcpStream) -> io::Result<u64> {
         buf.extend_from_slice(&tmp[..n]);
     }
 
-    let resp = match redirect_target(&buf) {
-        Some(location) => format!(
-            "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\n\
-             Content-Length: 0\r\nConnection: close\r\n\r\n"
-        ),
-        None => "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\
-                 Connection: close\r\n\r\nbad request\n"
-            .to_string(),
-    };
+    let resp = build_response(rules, &buf);
     let n = resp.len() as u64;
-    let (r, _) = client.write_all(resp.into_bytes()).await;
+    let (r, _) = client.write_all(resp).await;
     r?;
     let _ = client.shutdown().await;
     Ok(n)
 }
 
-/// Build the `https://host/path` target from a request head, or `None` if the
-/// request line or Host header is missing/unusable.
-fn redirect_target(head: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(head).ok()?;
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next()?;
-    // "GET /path?q HTTP/1.1"
-    let path = request_line.split_whitespace().nth(1)?;
-    if !path.starts_with('/') {
-        return None; // not an origin-form request target
+/// Decide the response bytes for a plaintext request `head` under `rules`.
+fn build_response(rules: &[HttpRule], head: &[u8]) -> Vec<u8> {
+    let host = crate::terminate::request_host(head);
+    let path = crate::terminate::request_path(head);
+
+    // No rules: the simple preset — 301 to the https:// equivalent.
+    if rules.is_empty() {
+        if host.is_empty() || !path.starts_with('/') {
+            return simple(400, "Bad Request", "bad request\n");
+        }
+        let location = format!("https://{host}{path}");
+        return format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
     }
-    let host = lines.find_map(|l| {
-        let (name, value) = l.split_once(':')?;
-        name.trim().eq_ignore_ascii_case("host").then(|| value.trim())
-    })?;
-    if host.is_empty() || host.contains('/') {
-        return None;
+
+    match crate::terminate::match_rule(rules, path) {
+        Some(rule) if rule.action != HttpAction::Forward => {
+            // A dynamic `https` redirect needs the Host; without it, 400.
+            let dynamic_https = rule.action == HttpAction::Redirect
+                && rule.to.as_deref().unwrap_or("https") == "https";
+            if dynamic_https && (host.is_empty() || !path.starts_with('/')) {
+                return simple(400, "Bad Request", "bad request\n");
+            }
+            crate::terminate::synthetic_response(rule, host, path, false)
+        }
+        // No matching rule (or a `forward` rule with no upstream here): 404.
+        _ => simple(404, "Not Found", "not found\n"),
     }
-    Some(format!("https://{host}{path}"))
+}
+
+fn simple(status: u16, reason: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -68,27 +86,47 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn builds_https_target() {
-        let head = b"GET /a/b?c=1 HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        assert_eq!(redirect_target(head).unwrap(), "https://example.com/a/b?c=1");
+    fn rule(path: &str, action: HttpAction) -> HttpRule {
+        HttpRule {
+            path: path.into(),
+            action,
+            status: None,
+            body: String::new(),
+            content_type: None,
+            to: None,
+        }
     }
 
     #[test]
-    fn host_is_case_insensitive() {
-        let head = b"GET / HTTP/1.1\r\nhOsT:  ex.org \r\n\r\n";
-        assert_eq!(redirect_target(head).unwrap(), "https://ex.org/");
+    fn default_redirects_to_https() {
+        let out = String::from_utf8(build_response(&[], b"GET /a?b=1 HTTP/1.1\r\nHost: ex.com\r\n\r\n"))
+            .unwrap();
+        assert!(out.starts_with("HTTP/1.1 301 Moved Permanently\r\n"), "{out}");
+        assert!(out.contains("Location: https://ex.com/a?b=1\r\n"), "{out}");
     }
 
     #[test]
-    fn missing_host_is_none() {
-        let head = b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\n";
-        assert!(redirect_target(head).is_none());
+    fn default_missing_host_is_400() {
+        let out = String::from_utf8(build_response(&[], b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\n")).unwrap();
+        assert!(out.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{out}");
     }
 
     #[test]
-    fn non_origin_target_is_none() {
-        let head = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        assert!(redirect_target(head).is_none());
+    fn rules_can_respond_404_on_plaintext() {
+        let mut r = rule("/blocked", HttpAction::Respond);
+        r.status = Some(404);
+        r.body = "nope\n".into();
+        let head = b"GET /blocked HTTP/1.1\r\nHost: ex.com\r\n\r\n";
+        let out = String::from_utf8(build_response(std::slice::from_ref(&r), head)).unwrap();
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
+        assert!(out.ends_with("\r\n\r\nnope\n"), "{out}");
+    }
+
+    #[test]
+    fn unmatched_rule_is_404() {
+        let r = rule("/only", HttpAction::Forward);
+        let head = b"GET /other HTTP/1.1\r\nHost: ex.com\r\n\r\n";
+        let out = String::from_utf8(build_response(std::slice::from_ref(&r), head)).unwrap();
+        assert!(out.starts_with("HTTP/1.1 404 Not Found\r\n"), "{out}");
     }
 }

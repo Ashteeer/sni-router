@@ -393,12 +393,18 @@ async fn handle_tcp(
         None => return Ok(()),
     };
 
-    // redirect_https answers directly (301 to https), no upstream connect.
+    // redirect_https answers directly (301 / rules), no upstream connect.
     if pool.mode == Mode::RedirectHttps {
         let bm = metrics::backend(backend_name);
         metrics::GLOBAL.conns_total.fetch_add(1, Ordering::Relaxed);
         bm.conns_total.fetch_add(1, Ordering::Relaxed);
-        let res = crate::redirect::handle(&buf, &mut client).await;
+        let rules = st
+            .cfg
+            .backends
+            .get(backend_name)
+            .map(|b| b.http_rules.as_slice())
+            .unwrap_or(&[]);
+        let res = crate::redirect::handle(&buf, &mut client, rules).await;
         let down = *res.as_ref().unwrap_or(&0);
         metrics::GLOBAL.bytes_down.fetch_add(down, Ordering::Relaxed);
         bm.bytes_down.fetch_add(down, Ordering::Relaxed);

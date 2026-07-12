@@ -175,20 +175,28 @@ pub struct Backend {
     pub servers: Vec<String>,
 }
 
-/// One terminate-mode request rule, matched by URL path prefix.
+/// One HTTP request rule, matched by URL path prefix. Rules work the same way
+/// on any HTTP-serving backend — `terminate` (over TLS) and `redirect_https`
+/// (plaintext) — so a redirect (301) or a direct response (404) can be placed
+/// wherever it is needed, not bound to a specific port or mode.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpRule {
     /// Path prefix to match (`/dns-query`), or `*` for catch-all.
     pub path: String,
     pub action: HttpAction,
-    /// `respond` action: HTTP status code (required for `respond`).
+    /// `respond`: HTTP status (required). `redirect`: optional (default 301).
     pub status: Option<u16>,
-    /// `respond` action: optional response body.
+    /// `respond`: optional response body.
     #[serde(default)]
     pub body: String,
-    /// `respond` action: `Content-Type` (default `text/plain`).
+    /// `respond`: `Content-Type` (default `text/plain`).
     pub content_type: Option<String>,
+    /// `redirect`: where to send the client (required for `redirect`). Either
+    /// the literal `https` (redirect to the `https://` URL for the same host and
+    /// path — the http->https upgrade) or an absolute URL like
+    /// `https://example.com/new`.
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -196,8 +204,10 @@ pub struct HttpRule {
 pub enum HttpAction {
     /// Forward the request to this backend's servers.
     Forward,
-    /// Answer directly with a synthetic response (no backend involved).
+    /// Answer directly with a synthetic response (status + optional body).
     Respond,
+    /// Answer with an HTTP redirect (3xx + `Location`).
+    Redirect,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

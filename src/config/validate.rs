@@ -268,7 +268,7 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                 if !b.http_rules.is_empty() {
                     d.push(Diagnostic::warning(
                         format!("{bp}.http_rules"),
-                        "http_rules are only applied in terminate mode",
+                        "http_rules are only applied in terminate and redirect_https modes",
                     ));
                 }
             }
@@ -276,7 +276,7 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                 if !b.servers.is_empty() {
                     d.push(Diagnostic::warning(
                         format!("{bp}.servers"),
-                        "servers are ignored in redirect_https mode (it sends a 301, no upstream)",
+                        "servers are ignored in redirect_https mode (it answers directly, no upstream)",
                     ));
                 }
                 if b.tls.is_some() {
@@ -285,12 +285,7 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                         "tls is ignored in redirect_https mode (it serves plaintext :80)",
                     ));
                 }
-                if !b.http_rules.is_empty() {
-                    d.push(Diagnostic::warning(
-                        format!("{bp}.http_rules"),
-                        "http_rules are only applied in terminate mode",
-                    ));
-                }
+                // http_rules ARE honored here (plaintext responder); no warning.
             }
         }
         // Validate http_rules content (applicability is warned per-mode above).
@@ -303,22 +298,64 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                 ));
             }
             match r.action {
-                HttpAction::Respond => match r.status {
-                    None => d.push(Diagnostic::error(
-                        format!("{rpth}.status"),
-                        "action \"respond\" requires a status code",
-                    )),
-                    Some(s) if !(100..600).contains(&s) => d.push(Diagnostic::error(
-                        format!("{rpth}.status"),
-                        format!("status {s} out of range (100-599)"),
-                    )),
-                    _ => {}
-                },
+                HttpAction::Respond => {
+                    match r.status {
+                        None => d.push(Diagnostic::error(
+                            format!("{rpth}.status"),
+                            "action \"respond\" requires a status code",
+                        )),
+                        Some(s) if !(100..600).contains(&s) => d.push(Diagnostic::error(
+                            format!("{rpth}.status"),
+                            format!("status {s} out of range (100-599)"),
+                        )),
+                        _ => {}
+                    }
+                    if r.to.is_some() {
+                        d.push(Diagnostic::warning(
+                            format!("{rpth}.to"),
+                            "\"to\" is ignored for action \"respond\" (use \"redirect\")",
+                        ));
+                    }
+                }
+                HttpAction::Redirect => {
+                    match &r.to {
+                        None => d.push(Diagnostic::error(
+                            format!("{rpth}.to"),
+                            "action \"redirect\" requires \"to\" (the literal \"https\" \
+                             or an absolute URL like \"https://example.com/\")",
+                        )),
+                        Some(t) if t != "https" && !t.contains("://") => {
+                            d.push(Diagnostic::error(
+                                format!("{rpth}.to"),
+                                format!(
+                                    "\"{t}\" is not a valid redirect target — use \"https\" \
+                                     or an absolute URL (scheme://host/...)"
+                                ),
+                            ))
+                        }
+                        _ => {}
+                    }
+                    if let Some(s) = r.status {
+                        if !(300..400).contains(&s) {
+                            d.push(Diagnostic::error(
+                                format!("{rpth}.status"),
+                                format!("redirect status {s} must be 3xx (default 301)"),
+                            ));
+                        }
+                    }
+                }
                 HttpAction::Forward => {
                     if r.status.is_some() {
                         d.push(Diagnostic::warning(
                             format!("{rpth}.status"),
                             "status is ignored for action \"forward\"",
+                        ));
+                    }
+                    if b.mode == Mode::RedirectHttps {
+                        d.push(Diagnostic::warning(
+                            format!("{rpth}.action"),
+                            "action \"forward\" has no servers to forward to in \
+                             redirect_https mode",
                         ));
                     }
                 }
@@ -714,6 +751,46 @@ backends:
 "#));
         assert!(
             errors(&d).iter().any(|e| e.message.contains("requires a status code")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_rule_requires_to() {
+        let d = validate(&cfg(r#"
+listeners:
+  - name: r
+    bind: ["0.0.0.0:80"]
+    routes: [{ sni: "*", backend: to_https }]
+backends:
+  to_https:
+    mode: redirect_https
+    http_rules:
+      - { path: "*", action: redirect }
+"#));
+        assert!(
+            errors(&d).iter().any(|e| e.message.contains("requires \"to\"")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_https_with_rules_has_no_warning() {
+        let d = validate(&cfg(r#"
+listeners:
+  - name: r
+    bind: ["0.0.0.0:80"]
+    routes: [{ sni: "*", backend: to_https }]
+backends:
+  to_https:
+    mode: redirect_https
+    http_rules:
+      - { path: "/health", action: respond, status: 200, body: "ok" }
+      - { path: "*", action: redirect, to: "https" }
+"#));
+        assert!(errors(&d).is_empty(), "{d:?}");
+        assert!(
+            !warnings(&d).iter().any(|w| w.message.contains("http_rules")),
             "{d:?}"
         );
     }

@@ -77,19 +77,28 @@ backends:
   #   servers:
   #     - "10.0.1.5:8080"
   #   # Optional per-path rules (first match wins; no rules = forward everything).
-  #   # Envoy-style DoH: forward /dns-query, answer everything else with 404.
+  #   # action: forward | respond | redirect. The SAME rules work on a
+  #   # redirect_https (plaintext) backend too — synthetic 404/301 anywhere.
   #   http_rules:
-  #     - path: "/dns-query"
+  #     - path: "/dns-query"          # forward this path to the servers above
   #       action: forward
-  #     - path: "*"
+  #     - path: "/old"                # 301/302/... to another URL
+  #       action: redirect
+  #       to: "https://example.com/new"
+  #       status: 301                 # optional, default 301
+  #     - path: "*"                   # answer everything else directly
   #       action: respond
   #       status: 404
   #       body: "not found\n"
   #       content_type: "text/plain"
 
-  # 301 http->https responder (no servers, no TLS — it serves plaintext :80):
+  # Plaintext responder on :80. With no http_rules it 301-redirects everything
+  # to https (the common one-liner). Add http_rules for custom 404/301 on :80.
   # to_https:
   #   mode: redirect_https
+  #   # http_rules:                    # optional; e.g. serve /health, redirect the rest
+  #   #   - { path: "/health", action: respond, status: 200, body: "ok\n" }
+  #   #   - { path: "*", action: redirect, to: "https" }   # "https" = same host+path over https
 
   # DoT / raw-TCP terminate: strip TLS, forward raw bytes to a DNS-over-TCP
   # server. Optional proxy_protocol passes the real client IP.
