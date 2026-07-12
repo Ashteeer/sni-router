@@ -1,8 +1,8 @@
 [package]
 name = "sni-router"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "High-performance SNI-based L4 router: TCP/UDP/QUIC passthrough without TLS termination"
+description = "High-performance SNI-aware edge router for Linux: TCP/UDP/QUIC passthrough plus TLS termination (HTTP/1.1, HTTP/2, WebSocket, DoT) on io_uring/monoio"
 license = "Apache-2.0"
 repository = "https://github.com/Ashteeer/sni-router"
 readme = "README.md"

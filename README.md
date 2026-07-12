@@ -1,23 +1,40 @@
 # sni-router
 
-High-performance SNI-based L4 router / proxy for Linux.
+High-performance SNI-aware edge router for Linux.
 
-Routes TCP, UDP and QUIC connections by TLS SNI (Server Name Indication)
-**without terminating TLS** — the handshake passes through untouched and
-backends keep their own certificates. An optional TLS-termination mode is
-planned.
+sni-router accepts TCP, UDP and QUIC connections and decides what to do with
+each one from the TLS SNI (Server Name Indication) — per backend, and without
+forcing a single behaviour on the whole port:
 
-Same class of tool as `sniproxy` / `sslh` / `nginx stream + ssl_preread`, but:
+- **Passthrough** — route by SNI and forward the raw stream, TLS untouched, so
+  backends keep their own certificates. Zero-copy on the fast path.
+- **Terminate** — terminate TLS at the router and act as a reverse proxy:
+  HTTP/1.1 and HTTP/2, header injection (`X-Real-IP` / `X-Forwarded-*`),
+  WebSocket upgrades, optional re-encrypt/mTLS to the backend, and per-path
+  rules (forward, synthetic responses, redirects).
+- **Raw-TCP terminate** — strip TLS and hand the backend a plain TCP stream,
+  for DoT (`:853`) and other non-HTTP protocols behind TLS.
+- **Redirect** — answer plaintext HTTP on `:80` with a `301` to `https://`.
 
-- **built for raw performance** — io_uring (`monoio`, thread-per-core),
-  zero-copy `splice()` forwarding, `SO_REUSEPORT` sharding with CPU pinning;
-- **TCP _and_ UDP/QUIC** out of the box, not TCP only;
-- **a config file a human can read** — flat YAML, sane defaults, first-match
-  routing. Closer to HAProxy than to Envoy, and simpler than both.
+One listener can mix all of these across different SNI names. The same tool
+therefore covers what usually takes `sniproxy`/`sslh` for passthrough *and* a
+separate HTTP reverse proxy for termination.
+
+Design priorities, in order:
+
+- **Raw performance** — io_uring (`monoio`, thread-per-core), zero-copy
+  `splice()` forwarding, `SO_REUSEPORT` sharding with CPU pinning.
+- **TCP _and_ UDP/QUIC** out of the box, not TCP only.
+- **A config a human can read** — flat YAML, sane defaults, first-match
+  routing. Closer to HAProxy than to Envoy, and simpler than both. See
+  [`config.md`](config.md) for the complete reference.
 
 ## Status
 
-Early development — **not production-ready yet**.
+**v1.0.0** — feature-complete for the capabilities listed below, with unit
+tests and live integration tests on real traffic. It handles untrusted input
+(anonymous TLS/QUIC ClientHellos), so roll it out deliberately and validate
+your config with `sni-router -t` first.
 
 | Milestone | State |
 |---|---|
