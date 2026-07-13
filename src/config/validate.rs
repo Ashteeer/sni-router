@@ -181,20 +181,25 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         }
         match b.mode {
             Mode::Terminate | Mode::TerminateTcp => {
-                // Both terminate modes present a TLS cert to clients.
-                match &b.tls {
+                // Both terminate modes present a TLS cert to clients: the
+                // backend's own `tls`, or the shared top-level `default_tls`.
+                match cfg.effective_tls(b) {
                     None => d.push(Diagnostic::error(
                         format!("{bp}.tls"),
                         format!(
-                            "mode \"{}\" requires a tls section with cert and key",
+                            "mode \"{}\" requires a tls section (cert and key), \
+                             or a top-level default_tls",
                             mode_name(b.mode)
                         ),
                     )),
                     Some(t) => {
+                        // Point diagnostics at whichever source supplied the cert.
+                        let src =
+                            if b.tls.is_some() { format!("{bp}.tls") } else { "default_tls".into() };
                         for (field, p) in [("cert", &t.cert), ("key", &t.key)] {
                             if let Err(e) = std::fs::File::open(p) {
                                 d.push(Diagnostic::error(
-                                    format!("{bp}.tls.{field}"),
+                                    format!("{src}.{field}"),
                                     format!("cannot read \"{}\": {e}", p.display()),
                                 ));
                             }

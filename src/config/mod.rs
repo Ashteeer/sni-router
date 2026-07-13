@@ -34,6 +34,20 @@ pub struct Config {
     /// Logging configuration.
     #[serde(default)]
     pub log: Log,
+    /// Shared TLS certificate used by every `terminate`/`terminate_tcp` backend
+    /// that doesn't set its own `tls`. Lets you point many backends at one
+    /// wildcard cert without repeating the paths. A backend's own `tls` always
+    /// wins over this.
+    #[serde(default)]
+    pub default_tls: Option<Tls>,
+}
+
+impl Config {
+    /// Effective TLS cert/key for a backend: its own `tls` if set, else the
+    /// shared `default_tls`.
+    pub fn effective_tls<'a>(&'a self, b: &'a Backend) -> Option<&'a Tls> {
+        b.tls.as_ref().or(self.default_tls.as_ref())
+    }
 }
 
 /// Prometheus-compatible metrics exporter. Served by a tiny blocking HTTP
@@ -147,8 +161,8 @@ pub struct Backend {
     pub balance: Balance,
     #[serde(default)]
     pub health_check: bool,
-    /// Required (and only used) when `mode: terminate`: the cert/key the router
-    /// presents to clients for server names routed to this backend.
+    /// Cert/key the router presents to clients for `terminate`/`terminate_tcp`.
+    /// Optional: if omitted, the top-level `default_tls` is used instead.
     pub tls: Option<Tls>,
     /// When set (terminate mode only), the router re-encrypts to the backend
     /// over TLS instead of forwarding plaintext. Absent = plaintext to backend.

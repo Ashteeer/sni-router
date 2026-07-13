@@ -88,17 +88,15 @@ impl TerminateCtx {
     /// Build the TLS contexts for every terminate backend. Returns the map
     /// plus the list of cert files to watch for renewal; backends that fail to
     /// build are reported and skipped.
-    pub fn build_all(
-        backends: &std::collections::BTreeMap<String, Backend>,
-    ) -> (HashMapCtx, Vec<CertWatch>) {
+    pub fn build_all(cfg: &crate::config::Config) -> (HashMapCtx, Vec<CertWatch>) {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut out = std::collections::HashMap::new();
         let mut watch = Vec::new();
-        for (name, b) in backends {
+        for (name, b) in &cfg.backends {
             if !matches!(b.mode, crate::config::Mode::Terminate | crate::config::Mode::TerminateTcp) {
                 continue;
             }
-            match Self::build_one(b, &provider) {
+            match Self::build_one(b, cfg.effective_tls(b), &provider) {
                 Ok(ctx) => {
                     watch.push(CertWatch {
                         resolver: ctx.resolver.clone(),
@@ -114,8 +112,12 @@ impl TerminateCtx {
         (out, watch)
     }
 
-    fn build_one(b: &Backend, provider: &Arc<rustls::crypto::CryptoProvider>) -> Result<Self, String> {
-        let tls = b.tls.as_ref().ok_or("terminate backend missing tls")?;
+    fn build_one(
+        b: &Backend,
+        tls: Option<&crate::config::Tls>,
+        provider: &Arc<rustls::crypto::CryptoProvider>,
+    ) -> Result<Self, String> {
+        let tls = tls.ok_or("terminate backend has no tls and no default_tls is set")?;
         let ck = build_certified_key(&tls.cert, &tls.key, provider)?;
         let resolver = Arc::new(SwapResolver { cert: ArcSwap::new(ck) });
         let mut server = ServerConfig::builder_with_provider(provider.clone())

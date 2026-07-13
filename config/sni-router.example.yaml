@@ -111,6 +111,13 @@ backends:
   #   servers:
   #     - "10.0.2.5:53"
 
+# Shared certificate for terminate backends. Any backend using mode: terminate
+# or terminate_tcp that does NOT set its own `tls:` falls back to this one — handy
+# when many backends share a single wildcard cert. A backend's own `tls:` wins.
+# default_tls:
+#   cert: "/etc/sni-router/certs/wildcard.pem"
+#   key: "/etc/sni-router/certs/wildcard.key"
+
 # Global timeouts, seconds (defaults shown).
 timeouts:
   handshake: 5                  # max time to read ClientHello (slowloris protection)

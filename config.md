@@ -22,14 +22,19 @@ be generated and edited programmatically and by non-DevOps users.
 ## 1. Top-level structure
 
 ```yaml
-listeners: [ ... ]     # required, >= 1  — how clients are accepted
-backends:  { ... }     # required, >= 1  — how the router talks to servers
-timeouts:  { ... }     # optional        — global timeouts (seconds)
-limits:    { ... }     # optional        — resource limits
-log:       { ... }     # optional        — logging
-metrics:   { ... }     # optional        — Prometheus exporter
-admin:     { ... }     # optional        — read-only REST API
+listeners:   [ ... ]   # required, >= 1  — how clients are accepted
+backends:    { ... }   # required, >= 1  — how the router talks to servers
+default_tls: { ... }   # optional        — shared cert for terminate backends
+timeouts:    { ... }   # optional        — global timeouts (seconds)
+limits:      { ... }   # optional        — resource limits
+log:         { ... }   # optional        — logging
+metrics:     { ... }   # optional        — Prometheus exporter
+admin:       { ... }   # optional        — read-only REST API
 ```
+
+`default_tls` is a single `{ cert, key }` object. Any `terminate`/`terminate_tcp`
+backend that omits its own `tls` uses it — so many backends can share one
+wildcard cert without repeating paths. A backend's own `tls` always wins.
 
 Mental model, and the single most important design rule:
 
@@ -178,12 +183,14 @@ to `redirect_https`.
 
 ### 3.5 `tls` (terminate / terminate_tcp)
 
-The certificate the router presents to clients for names routed here.
+The certificate the router presents to clients for names routed here. Optional
+per backend: if omitted, the top-level `default_tls` is used instead (at least
+one of the two must supply a cert for a terminate backend).
 
 | field  | type   | required | notes |
 |--------|--------|----------|-------|
-| `cert` | string | yes      | path to PEM cert chain |
-| `key`  | string | yes      | path to PEM private key |
+| `cert` | string | if no `default_tls` | path to PEM cert chain |
+| `key`  | string | if no `default_tls` | path to PEM private key |
 
 Files must exist and be readable at validation time. Certs are **hot‑reloaded**:
 if the files change on disk (certbot/lego renewal), they are picked up with zero
@@ -365,7 +372,8 @@ Errors (exit non‑zero):
 4. Duplicate `(proto, IP:port)` binds.
 5. Every `route.backend` names an existing backend (with a "did you mean …?"
    suggestion on a near miss).
-6. `terminate`/`terminate_tcp` have a `tls` section with readable `cert`/`key`.
+6. `terminate`/`terminate_tcp` have a cert with readable `cert`/`key` — either
+   the backend's own `tls` or the top-level `default_tls`.
 7. `backend_tls` files readable; mTLS needs both `client_cert` and `client_key`.
 8. `http2: true` not combined with `backend_tls`.
 9. `http_rules`: `path` non‑empty; `respond` has a valid `status` (100–599);
@@ -391,10 +399,14 @@ TCP connect to each server (opt‑in side effect).
 
 - **SIGHUP**: re‑reads and validates the file. On any error the old config keeps
   serving. Applies changes to routes/backends/timeouts/ACLs for **new**
-  connections; live connections keep the config they started with. Changing
-  `bind`/`proto` requires a restart (rejected on reload).
-- **SIGTERM/SIGINT**: stop accepting new connections, wait up to
-  `timeouts.drain` seconds for active ones to finish, then exit.
+  connections; live connections keep the config they started with (zero
+  downtime). If `bind`/`proto` changed, it instead **fast-restarts** in place
+  (re-exec, same PID) to apply the new listeners — active connections drop.
+- **SIGUSR1**: fast restart on demand — validate the config, then re-exec in
+  place, dropping all connections and rebinding immediately (no drain). Use this
+  as the quick "restart now" instead of stop+start.
+- **SIGTERM/SIGINT**: graceful shutdown — stop accepting new connections, wait up
+  to `timeouts.drain` seconds for active ones to finish, then exit.
 
 ---
 
@@ -500,6 +512,7 @@ backends:
 Config {
   listeners: Listener[]                       // >= 1
   backends: { [name: string]: Backend }       // >= 1
+  default_tls?: { cert: string, key: string } // shared cert for terminate backends
   timeouts?: { handshake, connect, idle, health_interval, drain }   // ints, seconds
   limits?: { max_client_hello, max_conns_per_ip }                   // ints
   log?: { level: enum, format: enum }

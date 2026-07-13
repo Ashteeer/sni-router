@@ -1,0 +1,37 @@
+name: sni-router
+base: core22
+# Keep in sync with Cargo.toml [package].version on every release (see CLAUDE.md).
+version: '1.0.0'
+summary: High-performance SNI-based L4 router (TCP/UDP/QUIC)
+description: |
+  sni-router routes TCP/UDP/QUIC connections by TLS SNI without terminating the
+  handshake (optional terminate mode is also supported). io_uring data path,
+  thread-per-core, zero-copy splice. Simple flat YAML config.
+
+  The config lives at $SNAP_DATA/sni-router.yaml (validate with
+  `sni-router -t`). The daemon starts once that file exists and is valid.
+
+grade: stable
+confinement: strict
+license: Apache-2.0
+
+apps:
+  sni-router:
+    command: bin/sni-router
+    daemon: simple
+    install-mode: disable      # user provides config first, then `snap start`
+    restart-condition: on-failure
+    environment:
+      SNI_ROUTER_CONFIG: $SNAP_DATA/sni-router.yaml
+    plugs:
+      - network
+      - network-bind
+
+parts:
+  sni-router:
+    plugin: rust
+    source: .
+    # ring (rustls terminate mode) needs a C toolchain + perl to build.
+    build-packages:
+      - gcc
+      - perl

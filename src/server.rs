@@ -82,7 +82,7 @@ fn build_state(cfg: Config) -> State {
 
 /// Run the router until killed. Blocks the calling thread.
 pub fn run(cfg: Config, config_path: PathBuf) -> io::Result<()> {
-    let (terminate, cert_watch) = crate::terminate::TerminateCtx::build_all(&cfg.backends);
+    let (terminate, cert_watch) = crate::terminate::TerminateCtx::build_all(&cfg);
     crate::terminate::spawn_cert_watcher(cert_watch);
 
     let shared = Arc::new(Shared {
@@ -605,13 +605,58 @@ fn reload(shared: &Shared) {
         return;
     }
     if !same_listeners(&shared.state.load().cfg, &cfg) {
-        tracing::error!(
-            "reload rejected: listener bind/proto changes require a restart; keeping running config"
+        // Accept sockets are bound once per worker at startup and can't be added
+        // or removed inside a running monoio runtime, so applying listener
+        // changes means a fresh bind. Re-exec ourselves: fast (no drain), picks
+        // up the new listeners, keeps the same PID for systemd. Config is already
+        // validated above, so the new image will start cleanly.
+        tracing::warn!(
+            "reload: listener bind/proto changed — fast-restarting to apply \
+             (active connections will drop)"
         );
-        return;
+        fast_restart();
     }
     shared.state.store(Arc::new(build_state(cfg)));
     tracing::info!("configuration reloaded");
+}
+
+/// Re-exec the current binary in place (same PID, same args/env). Sockets close
+/// on exec (CLOEXEC), dropping all connections, then the fresh process rebinds —
+/// a fast restart without the graceful drain. Only returns on failure.
+#[cfg(unix)]
+fn fast_restart() -> ! {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let err = std::process::Command::new(exe).args(args).exec();
+    tracing::error!(error = %err, "fast restart (re-exec) failed; exiting");
+    std::process::exit(1);
+}
+
+#[cfg(not(unix))]
+fn fast_restart() -> ! {
+    std::process::exit(1);
+}
+
+/// SIGUSR1 handler: validate the on-disk config, then fast-restart if it's good.
+/// A broken config keeps the running process alive (same guarantee as SIGHUP).
+#[cfg(unix)]
+fn fast_restart_checked(shared: &Shared) {
+    match crate::config::load(&shared.config_path) {
+        Ok(cfg) => {
+            let diags = crate::config::validate::validate(&cfg);
+            if diags.iter().any(|d| d.level == Level::Error) {
+                tracing::error!("fast restart aborted: config has errors; keeping running config");
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "fast restart aborted: cannot parse config");
+            return;
+        }
+    }
+    tracing::warn!("SIGUSR1: fast-restarting (dropping all connections)");
+    fast_restart();
 }
 
 /// Do the two configs have the same listener bind/proto structure? (SIGHUP can
@@ -631,18 +676,20 @@ fn same_listeners(a: &Config, b: &Config) -> bool {
 
 #[cfg(unix)]
 fn spawn_signal_thread(shared: Arc<Shared>) {
-    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1};
     std::thread::spawn(move || {
-        let mut signals = match signal_hook::iterator::Signals::new([SIGHUP, SIGTERM, SIGINT]) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "signal handler setup failed");
-                return;
-            }
-        };
+        let mut signals =
+            match signal_hook::iterator::Signals::new([SIGHUP, SIGTERM, SIGINT, SIGUSR1]) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "signal handler setup failed");
+                    return;
+                }
+            };
         for sig in signals.forever() {
             match sig {
                 SIGHUP => reload(&shared),
+                SIGUSR1 => fast_restart_checked(&shared),
                 SIGTERM | SIGINT => graceful_shutdown(&shared),
                 _ => {}
             }
