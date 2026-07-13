@@ -568,6 +568,36 @@ backends:
     }
 
     #[test]
+    fn terminate_needs_cert_from_backend_or_default_tls() {
+        let base = r#"
+listeners:
+  - name: l
+    bind: ["0.0.0.0:443"]
+    routes: [{ sni: "*", backend: t }]
+backends:
+  t:
+    mode: terminate
+    servers: ["10.0.0.1:8080"]
+"#;
+        // No backend tls and no default_tls -> "requires a tls section" error.
+        let d = validate(&cfg(base));
+        assert!(
+            errors(&d).iter().any(|e| e.message.contains("requires a tls section")),
+            "{d:?}"
+        );
+
+        // Adding default_tls satisfies the requirement; the only remaining errors
+        // point at the (nonexistent) default_tls files, proving inheritance ran.
+        let with_default = format!("{base}default_tls:\n  cert: /no/such/cert.pem\n  key: /no/such/key.pem\n");
+        let d = validate(&cfg(&with_default));
+        assert!(
+            !errors(&d).iter().any(|e| e.message.contains("requires a tls section")),
+            "default_tls should satisfy the cert requirement: {d:?}"
+        );
+        assert!(errors(&d).iter().any(|e| e.path.starts_with("default_tls")), "{d:?}");
+    }
+
+    #[test]
     fn duplicate_bind_same_proto_is_error() {
         let d = validate(&cfg(r#"
 listeners:
