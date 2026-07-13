@@ -22,6 +22,9 @@ const HEAD_MAX: usize = 16 * 1024;
 /// Cap on a `PUT /config` body — a config file is a few KiB; anything past this
 /// is refused rather than buffered.
 const BODY_MAX: usize = 1024 * 1024;
+/// Whole-connection deadline (TLS handshake + request + response). Bounds the
+/// buffers a slowloris-style client can pin on the control plane.
+const CONN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Accept loop for the admin listener. Spawned once (on core 0). `acceptor`
 /// is `Some` when the API is served over TLS.
@@ -32,16 +35,19 @@ pub async fn serve(listener: TcpListener, shared: Arc<Shared>, acceptor: Option<
                 let shared = shared.clone();
                 let acceptor = acceptor.clone();
                 monoio::spawn(async move {
-                    match acceptor {
-                        Some(acc) => {
-                            if let Ok(tls) = acc.accept(stream).await {
-                                let _ = handle(tls, shared).await;
+                    let _ = monoio::time::timeout(CONN_TIMEOUT, async move {
+                        match acceptor {
+                            Some(acc) => {
+                                if let Ok(tls) = acc.accept(stream).await {
+                                    let _ = handle(tls, shared).await;
+                                }
+                            }
+                            None => {
+                                let _ = handle(stream, shared).await;
                             }
                         }
-                        None => {
-                            let _ = handle(stream, shared).await;
-                        }
-                    }
+                    })
+                    .await;
                 });
             }
             Err(_) => monoio::time::sleep(Duration::from_millis(20)).await,
@@ -71,16 +77,15 @@ where
         buf.extend_from_slice(&tmp[..n]);
     };
 
-    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let request_line = head.split("\r\n").next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
 
     let state = shared.state.load_full();
-    let token = state.cfg.admin.as_ref().and_then(|a| a.token.clone());
-    let is_write = matches!(method.as_str(), "PUT" | "POST");
+    let token = state.cfg.admin.as_ref().and_then(|a| a.token.as_deref());
+    let is_write = matches!(method, "PUT" | "POST");
 
     // Writes are gated behind a configured token: without one they are refused,
     // so the config can never be changed unauthenticated.
@@ -95,19 +100,16 @@ where
         .await;
     }
     // When a token is set, every request must present it (reads included).
-    if let Some(tok) = &token {
-        let expected = format!("Bearer {tok}");
-        let authorized = head.split("\r\n").any(|l| {
-            l.split_once(':').is_some_and(|(n, v)| {
-                n.trim().eq_ignore_ascii_case("authorization") && v.trim() == expected
-            })
-        });
-        if !authorized {
+    if let Some(tok) = token {
+        let presented = header_value(&head, "authorization")
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::trim);
+        if !presented.is_some_and(|p| ct_eq(p.as_bytes(), tok.as_bytes())) {
             return respond(&mut s, 401, "Unauthorized", "text/plain", b"unauthorized\n").await;
         }
     }
 
-    match (method.as_str(), path.as_str()) {
+    match (method, path) {
         ("GET", "/healthz") => respond(&mut s, 200, "OK", "text/plain", b"ok\n").await,
         ("GET", "/status") => {
             let body = status_json(&state, shared.started);
@@ -183,15 +185,24 @@ where
             return respond(s, 400, "Bad Request", "application/json", msg.as_bytes()).await;
         }
     };
-    let diags = crate::config::validate::validate(&cfg);
-    let errors: Vec<String> = diags
-        .iter()
-        .filter(|d| d.level == crate::config::validate::Level::Error)
-        .map(|d| format!("{{\"path\":\"{}\",\"message\":\"{}\"}}", esc(&d.path), esc(&d.message)))
-        .collect();
-    if !errors.is_empty() {
-        let body = format!("{{\"error\":\"validation failed\",\"errors\":[{}]}}\n", errors.join(","));
+    if let Err(body) = validation_errors(&cfg) {
         return respond(s, 400, "Bad Request", "application/json", body.as_bytes()).await;
+    }
+
+    // GET /config redacts admin.token, so a GET → edit → PUT round-trip would
+    // silently strip the token from the file, leaving the API unauthenticated
+    // after the next restart. Refuse that; removing auth deliberately means
+    // editing the file on disk.
+    let cur_token_set = shared
+        .state
+        .load()
+        .cfg
+        .admin
+        .as_ref()
+        .is_some_and(|a| a.token.is_some());
+    if cur_token_set && cfg.admin.as_ref().is_some_and(|a| a.token.is_none()) {
+        return respond(s, 400, "Bad Request", "application/json",
+            b"{\"error\":\"admin.token is missing (GET /config redacts it) - include the token in the body, or remove it by editing the file on disk\"}\n").await;
     }
 
     // Write atomically (temp + rename) so a crash mid-write can't corrupt it.
@@ -258,25 +269,54 @@ where
 fn load_and_check(path: &Path) -> Result<crate::config::Config, String> {
     let cfg = crate::config::load(path)
         .map_err(|e| format!("{{\"error\":\"parse: {}\"}}\n", esc(&e)))?;
-    let diags = crate::config::validate::validate(&cfg);
+    validation_errors(&cfg)?;
+    Ok(cfg)
+}
+
+/// Run the same static validation as `-t`; errors come back as a JSON body.
+fn validation_errors(cfg: &crate::config::Config) -> Result<(), String> {
+    let diags = crate::config::validate::validate(cfg);
     let errors: Vec<String> = diags
         .iter()
         .filter(|d| d.level == crate::config::validate::Level::Error)
         .map(|d| format!("{{\"path\":\"{}\",\"message\":\"{}\"}}", esc(&d.path), esc(&d.message)))
         .collect();
     if errors.is_empty() {
-        Ok(cfg)
+        Ok(())
     } else {
         Err(format!("{{\"error\":\"validation failed\",\"errors\":[{}]}}\n", errors.join(",")))
     }
 }
 
+/// Constant-time byte comparison for the bearer token, so response timing
+/// doesn't leak how many leading bytes of a guess were right.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Write `bytes` to `path` via a temp file in the same directory + rename, so a
-/// reader never sees a half-written config.
+/// reader never sees a half-written config. The temp file is created with the
+/// target's existing permissions (0600 for a new file) — the config holds the
+/// admin token, and a umask-default 0644 temp would make it world-readable
+/// after the rename.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    let res = (|| {
+        std::fs::write(&tmp, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(path)
+                .map(|m| m.permissions())
+                .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&tmp, perms)?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
@@ -351,9 +391,10 @@ fn mode_str(m: Mode) -> &'static str {
     }
 }
 
-/// Minimal JSON string escaping for the values we emit (also covers `\n`/`\t`
-/// that can appear in serde error messages).
+/// Minimal JSON string escaping for the values we emit (serde error messages
+/// can carry newlines and, in principle, other control characters).
 fn esc(s: &str) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -362,6 +403,9 @@ fn esc(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }

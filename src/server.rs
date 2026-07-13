@@ -208,21 +208,18 @@ fn worker(core: usize, shared: Arc<Shared>) {
         if core == 0 {
             let snap = shared.state.load_full();
             if let Some(admin) = &snap.cfg.admin {
-                let acceptor = match snap.cfg.effective_admin_tls() {
-                    Some(tls) => match crate::terminate::build_acceptor(tls) {
-                        Ok(a) => Some(a),
-                        Err(e) => {
-                            tracing::error!(error = %e, "admin TLS setup failed; API disabled");
-                            None
-                        }
-                    },
-                    None => None,
-                };
                 // With TLS misconfigured we skip the listener rather than expose
                 // the write API in plaintext by accident.
-                let tls_ok = snap.cfg.effective_admin_tls().is_none() || acceptor.is_some();
-                if tls_ok {
-                    match TcpListener::bind(admin.bind.as_str()) {
+                let acceptor = match snap.cfg.effective_admin_tls() {
+                    Some(tls) => match crate::terminate::build_acceptor(tls) {
+                        Ok(a) => Ok(Some(a)),
+                        Err(e) => Err(e),
+                    },
+                    None => Ok(None),
+                };
+                match acceptor {
+                    Err(e) => tracing::error!(error = %e, "admin TLS setup failed; API disabled"),
+                    Ok(acceptor) => match TcpListener::bind(admin.bind.as_str()) {
                         Ok(l) => {
                             let scheme = if acceptor.is_some() { "https" } else { "http" };
                             tracing::info!(bind = %admin.bind, scheme, "admin API listening");
@@ -232,7 +229,7 @@ fn worker(core: usize, shared: Arc<Shared>) {
                         Err(e) => {
                             tracing::error!(bind = %admin.bind, error = %e, "admin bind failed")
                         }
-                    }
+                    },
                 }
             }
         }
@@ -674,8 +671,11 @@ where
 // SIGHUP reload + health checks
 // ---------------------------------------------------------------------------
 
-/// Rebuild reloadable state from the config file. Invalid configs and
-/// bind/proto changes are rejected; the running config keeps serving.
+/// Rebuild reloadable state from the config file. Invalid configs are
+/// rejected; the running config keeps serving. Changes that can't be
+/// hot-swapped (listener bind/proto, terminate TLS, `default_tls`,
+/// admin/metrics/log) trigger a fast restart — same semantics as the admin
+/// API's `apply_config`, so SIGHUP never silently ignores part of an edit.
 fn reload(shared: &Shared) {
     let cfg = match crate::config::load(&shared.config_path) {
         Ok(c) => c,
@@ -692,20 +692,21 @@ fn reload(shared: &Shared) {
         }
         return;
     }
-    if !same_listeners(&shared.state.load().cfg, &cfg) {
-        // Accept sockets are bound once per worker at startup and can't be added
-        // or removed inside a running monoio runtime, so applying listener
-        // changes means a fresh bind. Re-exec ourselves: fast (no drain), picks
-        // up the new listeners, keeps the same PID for systemd. Config is already
-        // validated above, so the new image will start cleanly.
-        tracing::warn!(
-            "reload: listener bind/proto changed — fast-restarting to apply \
-             (active connections will drop)"
-        );
-        fast_restart();
+    match shared.apply_config(cfg) {
+        Applied::HotSwapped => tracing::info!("configuration reloaded"),
+        Applied::RestartRequired => {
+            // Accept sockets and terminate TLS contexts are built once at
+            // startup and can't change inside a running monoio runtime, so a
+            // fresh bind is needed. Re-exec: fast (no drain), keeps the same
+            // PID for systemd. Config is already validated, so the new image
+            // will start cleanly.
+            tracing::warn!(
+                "reload: non-hot-swappable change (listeners/TLS/admin/metrics/log) — \
+                 fast-restarting to apply (active connections will drop)"
+            );
+            fast_restart();
+        }
     }
-    shared.state.store(Arc::new(build_state(cfg)));
-    tracing::info!("configuration reloaded");
 }
 
 /// Re-exec the current binary in place (same PID, same args/env). Sockets close
@@ -761,21 +762,6 @@ fn fast_restart_checked(shared: &Shared) {
     }
     tracing::warn!("SIGUSR1: fast-restarting (dropping all connections)");
     fast_restart();
-}
-
-/// Do the two configs have the same listener bind/proto structure? (SIGHUP can
-/// only change routes/backends/timeouts/acls, not the accept sockets.)
-fn same_listeners(a: &Config, b: &Config) -> bool {
-    a.listeners.len() == b.listeners.len()
-        && a.listeners.iter().zip(&b.listeners).all(|(x, y)| {
-            x.proto == y.proto && {
-                let mut xb = x.bind.clone();
-                let mut yb = y.bind.clone();
-                xb.sort();
-                yb.sort();
-                xb == yb
-            }
-        })
 }
 
 #[cfg(unix)]

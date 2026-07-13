@@ -128,6 +128,11 @@ admin:
   bind: "$ADMIN_HOST:$ADMIN_PORT"
   token: "$ADMIN_TOKEN"
 EOF
+  # The config now holds the admin token — keep it out of reach of other local
+  # users. systemd's ConfigurationDirectory= chowns /etc/sni-router (and its
+  # contents) to the service's DynamicUser on start, so the service can still
+  # read and rewrite it.
+  chmod 600 "$CONF_DIR/sni-router.yaml"
 else
   echo "==> keeping existing config $CONF_DIR/sni-router.yaml"
 fi

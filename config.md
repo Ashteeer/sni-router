@@ -374,7 +374,7 @@ can't be changed unauthenticated):
 
 | method + path   | body        | effect |
 |-----------------|-------------|--------|
-| `PUT /config`   | YAML config | validate → atomically replace the config file → apply. Invalid config → `400` with a JSON error list, **nothing is written**. |
+| `PUT /config`   | YAML config | validate → atomically replace the config file → apply. Invalid config → `400` with a JSON error list, **nothing is written**. The body **must include `admin.token`** while one is configured (`GET /config` redacts it, so a blind GET→PUT round‑trip is rejected with `400` instead of silently disabling auth). |
 | `POST /reload`  | —           | re‑read the config file from disk and apply it (like SIGHUP). |
 | `POST /restart` | —           | validate the on‑disk config, then re‑exec the process (drops connections, rebinds immediately). Privilege‑free equivalent of `systemctl restart`. |
 

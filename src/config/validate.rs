@@ -410,11 +410,31 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
 
     // Admin API bind address + optional TLS cert.
     if let Some(admin) = &cfg.admin {
-        if admin.bind.parse::<SocketAddr>().is_err() {
-            d.push(Diagnostic::error(
-                "admin.bind",
-                format!("invalid address \"{}\" — expected IP:port", admin.bind),
-            ));
+        match admin.bind.parse::<SocketAddr>() {
+            Err(_) => {
+                d.push(Diagnostic::error(
+                    "admin.bind",
+                    format!("invalid address \"{}\" — expected IP:port", admin.bind),
+                ));
+            }
+            Ok(addr) if !addr.ip().is_loopback() => {
+                if cfg.effective_admin_tls().is_none() {
+                    d.push(Diagnostic::warning(
+                        "admin.bind",
+                        "admin API on a non-loopback address without TLS — the token and \
+                         config travel in plaintext; set admin.tls / default_tls or bind to \
+                         127.0.0.1",
+                    ));
+                }
+                if admin.token.is_none() {
+                    d.push(Diagnostic::warning(
+                        "admin.token",
+                        "admin API on a non-loopback address without a token — /status and \
+                         /config are readable by anyone who can reach it",
+                    ));
+                }
+            }
+            Ok(_) => {}
         }
         if let Some(t) = &admin.tls {
             for (field, p) in [("cert", &t.cert), ("key", &t.key)] {
