@@ -400,10 +400,12 @@ A validation error body:
 ```
 
 > **Writable config file.** `PUT /config` rewrites the config on disk, so the
-> service process must have write access to it. The provided systemd unit sets
-> `ConfigurationDirectory=sni-router` so the (DynamicUser) service owns
-> `/etc/sni-router` and can replace the file. Under snap the config lives in
-> `$SNAP_DATA` (already writable).
+> service process must have write access to it. The installer creates a static
+> `sni-router` system user that owns `/etc/sni-router` (0750, config 0600 — it
+> holds the admin token) and runs the service as that user. (`DynamicUser`
+> doesn't work here: systemd does not chown an existing config directory to the
+> dynamic user.) Under snap the config lives in `$SNAP_DATA` (already writable
+> by the root daemon).
 
 ---
 

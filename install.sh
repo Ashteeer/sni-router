@@ -128,18 +128,28 @@ admin:
   bind: "$ADMIN_HOST:$ADMIN_PORT"
   token: "$ADMIN_TOKEN"
 EOF
-  # The config now holds the admin token — keep it out of reach of other local
-  # users. systemd's ConfigurationDirectory= chowns /etc/sni-router (and its
-  # contents) to the service's DynamicUser on start, so the service can still
-  # read and rewrite it.
-  chmod 600 "$CONF_DIR/sni-router.yaml"
 else
   echo "==> keeping existing config $CONF_DIR/sni-router.yaml"
 fi
 
-if [ ! -f "$UNIT" ] || [ "$REINSTALL" -eq 1 ]; then
-  echo "==> installing systemd unit"
-  cat > "$UNIT" <<'EOF'
+# Static system user owning /etc/sni-router: the config holds the admin token
+# (must not be world-readable) and `PUT /config` rewrites it from inside the
+# service. DynamicUser can't do this — systemd does not chown an existing
+# ConfigurationDirectory (or its files) to the dynamic user, so the service
+# could neither read a 0600 config nor replace it (verified on systemd 255).
+if ! id -u sni-router >/dev/null 2>&1; then
+  useradd --system --user-group --no-create-home --shell /usr/sbin/nologin sni-router
+fi
+chown -R sni-router:sni-router "$CONF_DIR"
+chmod 750 "$CONF_DIR"
+[ -f "$CONF_DIR/sni-router.yaml" ] && chmod 600 "$CONF_DIR/sni-router.yaml"
+
+# The unit file is installer-owned and kept in sync with the binary on every
+# run (v1.2.0 switched DynamicUser to the static sni-router user, and the new
+# 0600 config is unreadable under the old unit). Customize via drop-ins
+# (systemctl edit sni-router), which survive this rewrite.
+echo "==> installing systemd unit"
+cat > "$UNIT" <<'EOF'
 [Unit]
 Description=sni-router - SNI-based L4 router
 Wants=network-online.target
@@ -149,10 +159,8 @@ After=network-online.target
 ExecStart=/usr/local/bin/sni-router
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
-DynamicUser=yes
-# Own /etc/sni-router as the (dynamic) service user so `PUT /config` from the
-# admin API can rewrite the config file in place.
-ConfigurationDirectory=sni-router
+User=sni-router
+Group=sni-router
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -161,8 +169,7 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-fi
+systemctl daemon-reload
 
 # On an update, restart the service if it's currently running so the new binary
 # takes over. try-restart is a no-op when the service is stopped.
