@@ -1,7 +1,8 @@
 name: sni-router
-base: core22
-# Keep in sync with Cargo.toml [package].version on every release (see CLAUDE.md).
-version: '1.0.0'
+base: core24                 # Ubuntu 24.04; sni-router supports 24.04 and newer only.
+# Keep in sync with Cargo.toml [package].version AND the GitHub release tag on
+# every release (see CLAUDE.md).
+version: '1.1.0'
 summary: High-performance SNI-based L4 router (TCP/UDP/QUIC)
 description: |
   sni-router routes TCP/UDP/QUIC connections by TLS SNI without terminating the
@@ -12,8 +13,18 @@ description: |
   `sni-router -t`). The daemon starts once that file exists and is valid.
 
 grade: stable
-confinement: strict
 license: Apache-2.0
+
+# Classic confinement, on purpose: strict confinement's seccomp allowlist does
+# NOT permit io_uring (io_uring_setup/enter/register), so monoio would fall back
+# to epoll and lose the whole point of the project. Classic runs unconfined, so
+# io_uring, CPU pinning (sched_setaffinity) and privileged binds all work at full
+# speed. Trade-off: classic snaps require manual Snap Store review before stable.
+confinement: classic
+
+platforms:
+  amd64:
+  arm64:
 
 apps:
   sni-router:
@@ -23,9 +34,6 @@ apps:
     restart-condition: on-failure
     environment:
       SNI_ROUTER_CONFIG: $SNAP_DATA/sni-router.yaml
-    plugs:
-      - network
-      - network-bind
 
 parts:
   sni-router:
