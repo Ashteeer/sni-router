@@ -65,6 +65,74 @@ pub struct Shared {
     conns_per_ip: Mutex<HashMap<IpAddr, u32>>,
 }
 
+/// Outcome of applying a new config through the admin API.
+pub enum Applied {
+    /// Reloadable state (routes/backends/timeouts/ACLs) was hot-swapped with no
+    /// downtime; live connections are unaffected.
+    HotSwapped,
+    /// The change touches something baked in at process start (listener
+    /// bind/proto, a terminate backend's TLS, `default_tls`, admin/metrics/log).
+    /// The caller should [`fast_restart`] to apply it (drops connections).
+    RestartRequired,
+}
+
+impl Shared {
+    /// The config file this process was started with (writes target it).
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.config_path
+    }
+
+    /// Apply an already-validated config. Hot-swaps when only reloadable state
+    /// changed; otherwise reports that a restart is needed (without performing
+    /// it, so the caller can respond first). Mirrors SIGHUP semantics.
+    pub fn apply_config(&self, cfg: Config) -> Applied {
+        if restart_sig(&self.state.load().cfg) != restart_sig(&cfg) {
+            return Applied::RestartRequired;
+        }
+        self.state.store(Arc::new(build_state(cfg)));
+        Applied::HotSwapped
+    }
+}
+
+/// Signature of the config parts that are fixed for the process lifetime and
+/// therefore can't be hot-swapped: listener bind/proto, every terminate backend
+/// (baked into an immutable `TerminateCtx`), `default_tls`, and the admin /
+/// metrics / log sections (bound or initialized once at startup). If this
+/// signature is unchanged, a config edit is safe to apply live. `admin.token`
+/// is `skip_serializing`, so a token-only change stays hot-swappable.
+fn restart_sig(cfg: &Config) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for l in &cfg.listeners {
+        let mut binds = l.bind.clone();
+        binds.sort();
+        let _ = write!(s, "L:{}:{:?}:{:?};", l.name, l.proto, binds);
+    }
+    // For terminate backends only the parts baked into the immutable
+    // TerminateCtx matter (cert, re-encrypt, headers, http2, http_rules, mode) —
+    // `servers`/`balance`/`health_check` are rebuilt into the pool on hot-swap,
+    // so a server-list edit stays zero-downtime.
+    for (name, b) in &cfg.backends {
+        if matches!(b.mode, Mode::Terminate | Mode::TerminateTcp) {
+            let _ = write!(
+                s,
+                "B:{name}:{:?}:{}:{}:{:?}:{}:{};",
+                b.mode,
+                serde_norway::to_string(&b.tls).unwrap_or_default(),
+                serde_norway::to_string(&b.backend_tls).unwrap_or_default(),
+                b.headers,
+                b.http2,
+                serde_norway::to_string(&b.http_rules).unwrap_or_default(),
+            );
+        }
+    }
+    let _ = write!(s, "DT:{:?};", serde_norway::to_string(&cfg.default_tls).ok());
+    let _ = write!(s, "AD:{:?};", serde_norway::to_string(&cfg.admin).ok());
+    let _ = write!(s, "MX:{:?};", serde_norway::to_string(&cfg.metrics).ok());
+    let _ = write!(s, "LOG:{:?};", serde_norway::to_string(&cfg.log).ok());
+    s
+}
+
 fn build_state(cfg: Config) -> State {
     let mut pools = HashMap::new();
     for (name, b) in &cfg.backends {
@@ -135,16 +203,36 @@ fn worker(core: usize, shared: Arc<Shared>) {
     rt.block_on(async move {
         let mut tasks = Vec::new();
 
-        // Admin API: a single control-plane listener, only on core 0.
+        // Admin API: a single control-plane listener, only on core 0. Served
+        // over TLS when admin.tls / default_tls supplies a cert, else plaintext.
         if core == 0 {
-            if let Some(admin) = &shared.state.load().cfg.admin {
-                match TcpListener::bind(admin.bind.as_str()) {
-                    Ok(l) => {
-                        tracing::info!(bind = %admin.bind, "admin API listening");
-                        let sh = shared.clone();
-                        tasks.push(monoio::spawn(crate::admin::serve(l, sh)));
+            let snap = shared.state.load_full();
+            if let Some(admin) = &snap.cfg.admin {
+                let acceptor = match snap.cfg.effective_admin_tls() {
+                    Some(tls) => match crate::terminate::build_acceptor(tls) {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            tracing::error!(error = %e, "admin TLS setup failed; API disabled");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                // With TLS misconfigured we skip the listener rather than expose
+                // the write API in plaintext by accident.
+                let tls_ok = snap.cfg.effective_admin_tls().is_none() || acceptor.is_some();
+                if tls_ok {
+                    match TcpListener::bind(admin.bind.as_str()) {
+                        Ok(l) => {
+                            let scheme = if acceptor.is_some() { "https" } else { "http" };
+                            tracing::info!(bind = %admin.bind, scheme, "admin API listening");
+                            let sh = shared.clone();
+                            tasks.push(monoio::spawn(crate::admin::serve(l, sh, acceptor)));
+                        }
+                        Err(e) => {
+                            tracing::error!(bind = %admin.bind, error = %e, "admin bind failed")
+                        }
                     }
-                    Err(e) => tracing::error!(bind = %admin.bind, error = %e, "admin bind failed"),
                 }
             }
         }
@@ -624,8 +712,24 @@ fn reload(shared: &Shared) {
 /// on exec (CLOEXEC), dropping all connections, then the fresh process rebinds —
 /// a fast restart without the graceful drain. Only returns on failure.
 #[cfg(unix)]
-fn fast_restart() -> ! {
+pub fn fast_restart() -> ! {
     use std::os::unix::process::CommandExt;
+    // The caller may be a worker thread pinned to a single core (e.g. the admin
+    // API runs on core 0). exec() inherits the CPU affinity mask, which would
+    // leave the re-exec'd process pinned to one core (available_parallelism → 1,
+    // one worker). Reset affinity to all online CPUs first so the fresh process
+    // spins up its full thread-per-core set again.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let n = libc::sysconf(libc::_SC_NPROCESSORS_ONLN);
+        if n > 0 {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for i in 0..(n as usize).min(libc::CPU_SETSIZE as usize) {
+                libc::CPU_SET(i, &mut set);
+            }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let err = std::process::Command::new(exe).args(args).exec();
@@ -634,7 +738,7 @@ fn fast_restart() -> ! {
 }
 
 #[cfg(not(unix))]
-fn fast_restart() -> ! {
+pub fn fast_restart() -> ! {
     std::process::exit(1);
 }
 

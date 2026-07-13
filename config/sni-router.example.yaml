@@ -141,10 +141,19 @@ log:
 # metrics:
 #   bind: "127.0.0.1:9100"
 
-# Read-only admin/REST API (optional): GET /status, /config, /healthz.
+# Admin/REST API (optional) — control plane for a future web UI.
+#   reads : GET  /status  /config  /healthz
+#   writes: PUT  /config   (validate + replace file + apply)
+#           POST /reload    (re-read config from disk)
+#           POST /restart   (re-exec the process now)
+# Writes REQUIRE a token (without one they return 403). Keep it on loopback, or
+# set `tls` (or default_tls) to serve it over HTTPS on a public interface.
 # admin:
 #   bind: "127.0.0.1:9000"
-#   token: "change-me"          # optional Bearer token (never echoed by /config)
+#   token: "change-me"          # Bearer token; required for writes, redacted in /config
+#   # tls:                       # serve the admin API over HTTPS (else default_tls, else plaintext)
+#   #   cert: "/etc/sni-router/certs/admin.pem"
+#   #   key:  "/etc/sni-router/certs/admin.key"
 
 # Reload without a restart: `kill -HUP <pid>` (or `systemctl reload sni-router`)
 # re-reads this file, validates it, and applies route/backend/timeout/acl changes

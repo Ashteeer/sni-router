@@ -48,6 +48,15 @@ impl Config {
     pub fn effective_tls<'a>(&'a self, b: &'a Backend) -> Option<&'a Tls> {
         b.tls.as_ref().or(self.default_tls.as_ref())
     }
+
+    /// Effective TLS cert/key for the admin API: `admin.tls` if set, else the
+    /// shared `default_tls`. `None` = serve plaintext HTTP.
+    pub fn effective_admin_tls(&self) -> Option<&Tls> {
+        self.admin
+            .as_ref()
+            .and_then(|a| a.tls.as_ref())
+            .or(self.default_tls.as_ref())
+    }
 }
 
 /// Prometheus-compatible metrics exporter. Served by a tiny blocking HTTP
@@ -84,17 +93,26 @@ pub enum LogFormat {
     Json,
 }
 
-/// Admin HTTP API. Read-only: `GET /status`, `GET /config`, `GET /healthz`.
+/// Admin HTTP API. Reads: `GET /status`, `GET /config`, `GET /healthz`.
+/// Writes (require a configured `token`): `PUT /config`, `POST /reload`,
+/// `POST /restart`.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Admin {
     /// Address to serve the admin API on, e.g. `127.0.0.1:9000`. Keep it on a
-    /// loopback / trusted interface.
+    /// loopback / trusted interface (or serve it over TLS, see `tls`).
     pub bind: String,
     /// Optional bearer token; when set, requests must send
     /// `Authorization: Bearer <token>`. Never echoed back by `GET /config`.
+    /// **Required for the write endpoints** — without it they return 403, so
+    /// the config can't be changed unauthenticated.
     #[serde(default, skip_serializing)]
     pub token: Option<String>,
+    /// Serve the admin API over HTTPS with this cert/key. If omitted, the
+    /// top-level `default_tls` is used; if neither is set, the API is plaintext
+    /// HTTP. A cert change is picked up on the next restart (not hot-reloaded).
+    #[serde(default)]
+    pub tls: Option<Tls>,
 }
 
 /// A listener only decides how client connections are accepted (`bind`, `proto`).
@@ -364,5 +382,11 @@ pub fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf, String>
 pub fn load(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("{}: cannot read file: {e}", path.display()))?;
-    serde_norway::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+    parse_str(&text)
+}
+
+/// Parse a config from an in-memory YAML string (used by the admin write API,
+/// which receives the config in the request body rather than from a file).
+pub fn parse_str(text: &str) -> Result<Config, String> {
+    serde_norway::from_str(text).map_err(|e| e.to_string())
 }

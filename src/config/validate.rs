@@ -408,13 +408,23 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         }
     }
 
-    // Admin API bind address.
+    // Admin API bind address + optional TLS cert.
     if let Some(admin) = &cfg.admin {
         if admin.bind.parse::<SocketAddr>().is_err() {
             d.push(Diagnostic::error(
                 "admin.bind",
                 format!("invalid address \"{}\" — expected IP:port", admin.bind),
             ));
+        }
+        if let Some(t) = &admin.tls {
+            for (field, p) in [("cert", &t.cert), ("key", &t.key)] {
+                if let Err(e) = std::fs::File::open(p) {
+                    d.push(Diagnostic::error(
+                        format!("admin.tls.{field}"),
+                        format!("cannot read \"{}\": {e}", p.display()),
+                    ));
+                }
+            }
         }
     }
 

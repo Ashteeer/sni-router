@@ -1,6 +1,6 @@
 [package]
 name = "sni-router"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "High-performance SNI-aware edge router for Linux: TCP/UDP/QUIC passthrough plus TLS termination (HTTP/1.1, HTTP/2, WebSocket, DoT) on io_uring/monoio"
 license = "Apache-2.0"

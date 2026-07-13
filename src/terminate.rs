@@ -193,6 +193,22 @@ impl TerminateCtx {
 
 type HashMapCtx = std::collections::HashMap<String, TerminateCtx>;
 
+/// Build a plain TLS acceptor from a cert/key pair, for the admin API. Unlike
+/// terminate backends this has no hot-reload watcher — a renewed admin cert is
+/// picked up on the next restart, which is fine for a low-traffic control plane.
+pub fn build_acceptor(tls: &crate::config::Tls) -> Result<TlsAcceptor, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let certs = load_certs(&tls.cert)?;
+    let key = load_key(&tls.key)?;
+    let cfg = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| e.to_string())?;
+    Ok(TlsAcceptor::from(Arc::new(cfg)))
+}
+
 fn build_certified_key(
     cert: &std::path::Path,
     key: &std::path::Path,

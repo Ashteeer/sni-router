@@ -29,7 +29,7 @@ timeouts:    { ... }   # optional        — global timeouts (seconds)
 limits:      { ... }   # optional        — resource limits
 log:         { ... }   # optional        — logging
 metrics:     { ... }   # optional        — Prometheus exporter
-admin:       { ... }   # optional        — read-only REST API
+admin:       { ... }   # optional        — REST API (config read + write, restart)
 ```
 
 `default_tls` is a single `{ cert, key }` object. Any `terminate`/`terminate_tcp`
@@ -350,15 +350,60 @@ UDP flows) and per‑backend series.
 
 ## 9. `admin` (object, optional)
 
-Read‑only REST API (foundation for a UI). Runs on one core.
+REST API and control plane (foundation for a web UI). Runs on one core.
 
 | field   | type   | required | notes |
 |---------|--------|----------|-------|
-| `bind`  | string | yes      | `IP:port`; keep on loopback/trusted interface |
-| `token` | string | no       | if set, requests must send `Authorization: Bearer <token>`; never echoed by `/config` |
+| `bind`  | string | yes      | `IP:port`; keep on loopback/trusted interface (or serve over TLS, see `tls`) |
+| `token` | string | no       | if set, requests must send `Authorization: Bearer <token>`; never echoed by `/config`. **Required for the write endpoints.** |
+| `tls`   | object | no       | `{ cert, key }` to serve the API over HTTPS. If omitted, `default_tls` is used; if neither is set, the API is plaintext HTTP. A cert change is applied on the next restart (not hot‑reloaded). |
 
-Endpoints: `GET /status` (JSON), `GET /config` (YAML, token redacted),
-`GET /healthz`.
+### 9.1 Endpoints
+
+Reads (allowed without a token, unless a token is configured — then all requests
+need it):
+
+| method + path   | returns | notes |
+|-----------------|---------|-------|
+| `GET /healthz`  | `ok`    | liveness |
+| `GET /status`   | JSON    | version, uptime, listeners, backends |
+| `GET /config`   | YAML    | the running config; `admin.token` redacted |
+
+Writes (**require `admin.token`** — without it they return `403`, so the config
+can't be changed unauthenticated):
+
+| method + path   | body        | effect |
+|-----------------|-------------|--------|
+| `PUT /config`   | YAML config | validate → atomically replace the config file → apply. Invalid config → `400` with a JSON error list, **nothing is written**. |
+| `POST /reload`  | —           | re‑read the config file from disk and apply it (like SIGHUP). |
+| `POST /restart` | —           | validate the on‑disk config, then re‑exec the process (drops connections, rebinds immediately). Privilege‑free equivalent of `systemctl restart`. |
+
+`PUT /config` and `POST /reload` reply with how the change was applied:
+
+```json
+{"status":"ok","applied":"reload","downtime":false}   // hot‑swapped, live conns kept
+{"status":"ok","applied":"restart","downtime":true}    // re‑exec was needed
+```
+
+**When a restart is needed vs. zero‑downtime hot‑swap** (same rule as SIGHUP): a
+change to routes, ACLs, timeouts, limits, or passthrough/redirect backends
+(including their server lists) is applied live. A change to a listener's
+`bind`/`proto`, a `terminate`/`terminate_tcp` backend's TLS/headers/http2/
+http_rules, `default_tls`, or the `admin`/`metrics`/`log` sections requires a
+restart — `PUT`/`POST` perform it automatically and report `"applied":"restart"`.
+(`admin.token` alone is hot‑swappable.)
+
+A validation error body:
+
+```json
+{"error":"validation failed","errors":[{"path":"backends.web.servers[0]","message":"\"10.0.0.1\" — missing port"}]}
+```
+
+> **Writable config file.** `PUT /config` rewrites the config on disk, so the
+> service process must have write access to it. The provided systemd unit sets
+> `ConfigurationDirectory=sni-router` so the (DynamicUser) service owns
+> `/etc/sni-router` and can replace the file. Under snap the config lives in
+> `$SNAP_DATA` (already writable).
 
 ---
 
@@ -407,6 +452,9 @@ TCP connect to each server (opt‑in side effect).
   as the quick "restart now" instead of stop+start.
 - **SIGTERM/SIGINT**: graceful shutdown — stop accepting new connections, wait up
   to `timeouts.drain` seconds for active ones to finish, then exit.
+- **Admin API**: `PUT /config` / `POST /reload` apply changes the same way as
+  SIGHUP (hot‑swap or restart, reported in the response); `POST /restart` forces
+  a re‑exec. See [§9.1](#91-endpoints).
 
 ---
 
@@ -517,7 +565,7 @@ Config {
   limits?: { max_client_hello, max_conns_per_ip }                   // ints
   log?: { level: enum, format: enum }
   metrics?: { bind: string }
-  admin?: { bind: string, token?: string }
+  admin?: { bind: string, token?: string, tls?: { cert: string, key: string } }
 }
 
 Listener {
