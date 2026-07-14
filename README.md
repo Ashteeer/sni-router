@@ -47,7 +47,8 @@ your config with `sni-router -t` first.
 | Re-encrypt to TLS backends (`backend_tls`) + mTLS | done |
 | Access control (allow/deny by client IP CIDR and SNI) | done |
 | QUIC v2 (RFC 9369) Initial decryption | done |
-| Management + metrics API — one bind, one token (`/status`, `/config`, `/healthz`, `/metrics`, `PUT`/`POST` writes) | done |
+| Management + metrics API — one bind, one token (`/status`, `/config`, `/healthz`, `/metrics`, `/version`, `PUT`/`POST` writes) | done |
+| Self-update — `sni-router -u` / `POST /update` (fetch latest release, replace binary, restart) | done |
 | Zero-downtime cert reload (certbot/lego renewals) | done |
 | Backend health checks (TCP probe) + connect retry across the pool | done |
 | Zero-copy `splice()` TCP forwarding | done |

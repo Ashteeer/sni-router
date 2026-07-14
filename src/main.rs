@@ -9,6 +9,7 @@ mod redirect;
 mod router;
 mod server;
 mod terminate;
+mod update;
 
 use config::validate::{Diagnostic, Level};
 use std::io::IsTerminal;
@@ -23,13 +24,16 @@ sni-router - SNI-based L4 router (TCP/UDP/QUIC passthrough)
 USAGE:
     sni-router [-c <config>]                      run the router
     sni-router -t [<config>] [--check-backends]   validate config and exit
+    sni-router -u [--force]                        update to the latest release
 
 OPTIONS:
     -t, --test-config [PATH]   validate configuration and exit (like `nginx -t`)
     -c, --config PATH          path to the config file
         --check-backends       with -t: also try a real TCP connect to every backend server
         --no-color             disable colored output
-    -V, --version              print version
+    -u, --update               download the latest release and replace this binary
+        --force                with -u: reinstall even if already on the latest version
+    -v, -V, --version          print version
     -h, --help                 print this help
 
 Config path resolution: explicit path > $SNI_ROUTER_CONFIG > /etc/sni-router/sni-router.yaml
@@ -37,14 +41,23 @@ Config path resolution: explicit path > $SNI_ROUTER_CONFIG > /etc/sni-router/sni
 
 struct Cli {
     test: bool,
+    update: bool,
+    force: bool,
     path: Option<PathBuf>,
     check_backends: bool,
     no_color: bool,
 }
 
-// ponytail: hand-rolled arg parsing, ~40 lines; switch to a CLI crate when flags outgrow it
+// ponytail: hand-rolled arg parsing, ~45 lines; switch to a CLI crate when flags outgrow it
 fn parse_args() -> Result<Cli, String> {
-    let mut cli = Cli { test: false, path: None, check_backends: false, no_color: false };
+    let mut cli = Cli {
+        test: false,
+        update: false,
+        force: false,
+        path: None,
+        check_backends: false,
+        no_color: false,
+    };
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -60,9 +73,11 @@ fn parse_args() -> Result<Cli, String> {
                 let v = args.next().ok_or_else(|| format!("{a} requires a path argument"))?;
                 cli.path = Some(PathBuf::from(v));
             }
+            "-u" | "--update" => cli.update = true,
+            "--force" => cli.force = true,
             "--check-backends" => cli.check_backends = true,
             "--no-color" => cli.no_color = true,
-            "-V" | "--version" => {
+            "-v" | "-V" | "--version" => {
                 println!("sni-router {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
@@ -84,6 +99,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Self-update needs no config — do it and exit before resolving a path.
+    if cli.update {
+        return update::run_cli(cli.force);
+    }
 
     let color = !cli.no_color
         && std::env::var_os("NO_COLOR").is_none()

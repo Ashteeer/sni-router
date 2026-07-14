@@ -365,6 +365,7 @@ Reads (need the token when one is configured — the installer always sets one):
 | `GET /status`   | JSON    | version, uptime, listeners, backends |
 | `GET /config`   | YAML    | the running config; `api.token` redacted |
 | `GET /metrics`  | text    | Prometheus exposition: global counters (connections, bytes, errors, rate‑limited, UDP flows) and per‑backend series |
+| `GET /version`  | JSON    | `{"version":"1.4.0"}` — the running binary's version |
 
 Writes (**require `api.token`** — without it they return `403`, so the config
 can't be changed unauthenticated):
@@ -374,6 +375,25 @@ can't be changed unauthenticated):
 | `PUT /config`   | YAML config | validate → atomically replace the config file → apply. Invalid config → `400` with a JSON error list, **nothing is written**. The body **must include `api.token`** while one is configured (`GET /config` redacts it, so a blind GET→PUT round‑trip is rejected with `400` instead of silently disabling auth). |
 | `POST /reload`  | —           | re‑read the config file from disk and apply it (like SIGHUP). |
 | `POST /restart` | —           | validate the on‑disk config, then re‑exec the process (drops connections, rebinds immediately). Privilege‑free equivalent of `systemctl restart`. |
+| `POST /update`  | —           | check GitHub for a newer release; if one exists, download it, replace the binary, and re‑exec into it. See below. |
+
+`POST /update` replies synchronously with the decision, then does the work in the
+background (a download can outlast the request, and the process re‑execs anyway —
+poll `GET /version` to confirm the new version is live):
+
+```json
+{"status":"ok","updated":false,"version":"1.4.0"}                       // already latest
+{"status":"ok","updated":true,"from":"1.3.0","to":"1.4.0","restarting":true}  // downloading, then restart
+```
+
+The update only ever fetches this project's **official** GitHub release assets
+(the repo is compiled in, never taken from the request), so it can only install an
+official build. It needs write access to the directory the binary lives in — the
+installer puts the binary under `/usr/local/lib/sni-router/` owned by the service
+user for exactly this reason (with a `/usr/local/bin/sni-router` symlink on PATH).
+The same logic backs the CLI: `sni-router -u` (`--update`, add `--force` to
+reinstall the latest even if already current) and `sni-router -v` prints the
+version.
 
 `PUT /config` and `POST /reload` reply with how the change was applied:
 
@@ -396,13 +416,15 @@ A validation error body:
 {"error":"validation failed","errors":[{"path":"backends.web.servers[0]","message":"\"10.0.0.1\" — missing port"}]}
 ```
 
-> **Writable config file.** `PUT /config` rewrites the config on disk, so the
-> service process must have write access to it. The installer creates a static
-> `sni-router` system user that owns `/etc/sni-router` (0750, config 0600 — it
-> holds the api token) and runs the service as that user. (`DynamicUser`
-> doesn't work here: systemd does not chown an existing config directory to the
-> dynamic user.) Under snap the config lives in `$SNAP_DATA` (already writable
-> by the root daemon).
+> **Writable config file & binary.** `PUT /config` rewrites the config on disk and
+> `POST /update` replaces the binary, so the service process must have write
+> access to both. The installer creates a static `sni-router` system user that
+> owns `/etc/sni-router` (0750, config 0600 — it holds the api token) **and**
+> `/usr/local/lib/sni-router/` (where the binary lives, with a
+> `/usr/local/bin/sni-router` symlink on PATH), and runs the service as that user.
+> (`DynamicUser` doesn't work here: systemd does not chown an existing directory
+> to the dynamic user.) Under snap the config lives in `$SNAP_DATA` (already
+> writable by the root daemon).
 
 ---
 

@@ -1,10 +1,11 @@
 //! Unified management + metrics API — the control plane for a web UI.
 //!
 //! Reads: `GET /status` (JSON), `GET /config` (YAML), `GET /healthz`,
-//! `GET /metrics` (Prometheus text).
+//! `GET /metrics` (Prometheus text), `GET /version`.
 //! Writes (require a configured `api.token`): `PUT /config` (replace the
 //! config file), `POST /reload` (re-read it from disk), `POST /restart`
-//! (re-exec the process — the privilege-free equivalent of a service restart).
+//! (re-exec the process — the privilege-free equivalent of a service restart),
+//! `POST /update` (fetch the latest release, install it, and re-exec).
 //!
 //! One bind, one token: when `api.token` is set every endpoint (metrics
 //! included) requires it. Runs on a single core (not reuseport) since it's a
@@ -128,9 +129,17 @@ where
             respond(&mut s, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body.as_bytes())
                 .await
         }
+        ("GET", "/version") => {
+            let body = format!(
+                "{{\"version\":\"{}\"}}\n",
+                esc(crate::update::current_version())
+            );
+            respond(&mut s, 200, "OK", "application/json", body.as_bytes()).await
+        }
         ("PUT", "/config") => put_config(&mut s, &shared, &head, &buf, head_end).await,
         ("POST", "/reload") => reload(&mut s, &shared).await,
         ("POST", "/restart") => restart(&mut s, &shared).await,
+        ("POST", "/update") => update(&mut s).await,
         ("GET", _) | ("PUT", _) | ("POST", _) => {
             respond(&mut s, 404, "Not Found", "text/plain", b"not found\n").await
         }
@@ -271,6 +280,68 @@ where
     respond(s, 200, "OK", "application/json",
         b"{\"status\":\"ok\",\"applied\":\"restart\",\"downtime\":true}\n").await?;
     crate::server::fast_restart()
+}
+
+/// `POST /update` — check for a newer release and, if one exists, install it and
+/// re-exec into the new binary.
+///
+/// The **check** (a small GitHub API call) runs synchronously so the response can
+/// report `updated:false` when already current, or announce the version it's
+/// moving to. The **download + replace + restart** then runs on a detached
+/// thread (it can outlast the request's slowloris deadline, and it re-execs the
+/// process — the connection drops either way). A client confirms the result by
+/// polling `GET /version` after the service comes back; a failed download is
+/// logged and leaves the running version unchanged.
+async fn update<S>(s: &mut S) -> io::Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent,
+{
+    match run_blocking(|| crate::update::check(false)).await {
+        Err(e) => {
+            let msg = format!("{{\"error\":\"update check failed: {}\"}}\n", esc(&e));
+            respond(s, 502, "Bad Gateway", "application/json", msg.as_bytes()).await
+        }
+        Ok(crate::update::Plan::AlreadyLatest { version }) => {
+            let body = format!(
+                "{{\"status\":\"ok\",\"updated\":false,\"version\":\"{}\"}}\n",
+                esc(&version)
+            );
+            respond(s, 200, "OK", "application/json", body.as_bytes()).await
+        }
+        Ok(crate::update::Plan::Available { from, to, tag, arch }) => {
+            let body = format!(
+                "{{\"status\":\"ok\",\"updated\":true,\"from\":\"{}\",\"to\":\"{}\",\"restarting\":true}}\n",
+                esc(&from),
+                esc(&to)
+            );
+            respond(s, 200, "OK", "application/json", body.as_bytes()).await?;
+            // Detached: survives this connection, then re-execs the whole process.
+            std::thread::spawn(move || match crate::update::apply(&tag, arch) {
+                Ok(()) => crate::server::fast_restart(),
+                Err(e) => tracing::error!(error = %e, "self-update failed; version unchanged"),
+            });
+            Ok(())
+        }
+    }
+}
+
+/// Run a blocking closure off the monoio runtime thread, awaiting its result
+/// without stalling core 0's data path. Used for the update check's network I/O.
+async fn run_blocking<T, F>(f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    loop {
+        if let Ok(v) = rx.try_recv() {
+            return v;
+        }
+        monoio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Load + validate a config file, returning a JSON error body on failure.

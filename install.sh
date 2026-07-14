@@ -24,6 +24,11 @@ set -euo pipefail
 
 REPO="Ashteeer/sni-router"
 BIN_DIR="/usr/local/bin"
+# The real binary lives in a directory owned by the service user so the service
+# can replace it itself (POST /update / `sni-router -u`): an atomic in-place
+# update needs write access to the directory the binary sits in. BIN_DIR just
+# holds a symlink for CLI convenience.
+LIBDIR="/usr/local/lib/sni-router"
 CONF_DIR="/etc/sni-router"
 UNIT="/etc/systemd/system/sni-router.service"
 
@@ -91,13 +96,28 @@ fi
 
 # Is this an update (binary already present) or a fresh install?
 UPDATE=0
-[ -x "$BIN_DIR/sni-router" ] && [ "$REINSTALL" -eq 0 ] && UPDATE=1
+{ [ -x "$LIBDIR/sni-router" ] || [ -x "$BIN_DIR/sni-router" ]; } && [ "$REINSTALL" -eq 0 ] && UPDATE=1
+
+# The service user must exist before it can own the binary directory.
+if ! id -u sni-router >/dev/null 2>&1; then
+  useradd --system --user-group --no-create-home --shell /usr/sbin/nologin sni-router
+fi
 
 ASSET="sni-router-$TAG-$ARCH-linux.tar.gz"
 echo "==> downloading $ASSET"
 dl "https://github.com/$REPO/releases/download/$TAG/$ASSET" "$TMP/$ASSET"
 tar -xzf "$TMP/$ASSET" -C "$TMP"
-install -m 0755 "$TMP/sni-router" "$BIN_DIR/sni-router"
+
+# Install the real binary into a service-owned directory, and expose it via a
+# symlink on PATH. The service user owns LIBDIR so it can atomically replace the
+# binary during a self-update.
+mkdir -p "$LIBDIR"
+install -m 0755 "$TMP/sni-router" "$LIBDIR/sni-router"
+chown -R sni-router:sni-router "$LIBDIR"
+chmod 0755 "$LIBDIR"
+# Migrate older installs that had a real binary at $BIN_DIR/sni-router.
+[ -e "$BIN_DIR/sni-router" ] && [ ! -L "$BIN_DIR/sni-router" ] && rm -f "$BIN_DIR/sni-router"
+ln -sfn "$LIBDIR/sni-router" "$BIN_DIR/sni-router"
 
 mkdir -p "$CONF_DIR"
 # Config: keep the user's on update; (re)write it only on a fresh install or --reinstall.
@@ -141,14 +161,12 @@ else
   echo "==> keeping existing config $CONF_DIR/sni-router.yaml"
 fi
 
-# Static system user owning /etc/sni-router: the config holds the admin token
-# (must not be world-readable) and `PUT /config` rewrites it from inside the
-# service. DynamicUser can't do this — systemd does not chown an existing
-# ConfigurationDirectory (or its files) to the dynamic user, so the service
-# could neither read a 0600 config nor replace it (verified on systemd 255).
-if ! id -u sni-router >/dev/null 2>&1; then
-  useradd --system --user-group --no-create-home --shell /usr/sbin/nologin sni-router
-fi
+# The static sni-router system user (created above) owns /etc/sni-router: the
+# config holds the api token (must not be world-readable) and `PUT /config`
+# rewrites it from inside the service. DynamicUser can't do this — systemd does
+# not chown an existing ConfigurationDirectory (or its files) to the dynamic
+# user, so the service could neither read a 0600 config nor replace it (verified
+# on systemd 255).
 chown -R sni-router:sni-router "$CONF_DIR"
 chmod 750 "$CONF_DIR"
 [ -f "$CONF_DIR/sni-router.yaml" ] && chmod 600 "$CONF_DIR/sni-router.yaml"
@@ -165,7 +183,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/sni-router
+ExecStart=/usr/local/lib/sni-router/sni-router
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 User=sni-router
@@ -210,10 +228,11 @@ else
     echo "  bind:     $API_HOST:$API_PORT"
     echo "  token:    $API_TOKEN"
     echo "  header:   Authorization: Bearer $API_TOKEN"
-    echo "  read:     GET  /status  /config  /healthz  /metrics"
+    echo "  read:     GET  /status  /config  /healthz  /metrics  /version"
     echo "  write:    PUT  /config      (replace config, auto reload/restart)"
     echo "            POST /reload      (re-read config from disk)"
     echo "            POST /restart     (restart the service now)"
+    echo "            POST /update      (update to the latest release, then restart)"
     echo "  example:  curl -s ${API_SCHEME}://${PRIMARY_IP}:${API_PORT}/status \\"
     echo "                 -H 'Authorization: Bearer $API_TOKEN'"
     echo "=================================================================="
