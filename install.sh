@@ -188,8 +188,14 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 User=sni-router
 Group=sni-router
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# CAP_NET_BIND_SERVICE: bind privileged ports (:443/:80/:853/:53) as non-root.
+# CAP_DAC_READ_SEARCH: read TLS certs/keys the service does not own — e.g.
+# Let's Encrypt's /etc/letsencrypt/{live,archive} (0700 root, keys 0600 root),
+# or any other root-only cert path. Lets `mode: terminate` and cert hot-reload
+# read (and re-read after renewal) certs from anywhere with zero manual chmod/
+# chown by the operator, while the process itself stays non-root the whole time.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_DAC_READ_SEARCH
 NoNewPrivileges=true
 LimitNOFILE=1048576
 

@@ -207,12 +207,7 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                         let src =
                             if b.tls.is_some() { format!("{bp}.tls") } else { "default_tls".into() };
                         for (field, p) in [("cert", &t.cert), ("key", &t.key)] {
-                            if let Err(e) = std::fs::File::open(p) {
-                                d.push(Diagnostic::error(
-                                    format!("{src}.{field}"),
-                                    format!("cannot read \"{}\": {e}", p.display()),
-                                ));
-                            }
+                            check_readable(&mut d, format!("{src}.{field}"), p);
                         }
                     }
                 }
@@ -224,12 +219,7 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                             ("client_key", &bt.client_key),
                         ] {
                             if let Some(path) = p {
-                                if let Err(e) = std::fs::File::open(path) {
-                                    d.push(Diagnostic::error(
-                                        format!("{bp}.backend_tls.{field}"),
-                                        format!("cannot read \"{}\": {e}", path.display()),
-                                    ));
-                                }
+                                check_readable(&mut d, format!("{bp}.backend_tls.{field}"), path);
                             }
                         }
                         if bt.client_cert.is_some() != bt.client_key.is_some() {
@@ -440,12 +430,7 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         }
         if let Some(t) = &api.tls {
             for (field, p) in [("cert", &t.cert), ("key", &t.key)] {
-                if let Err(e) = std::fs::File::open(p) {
-                    d.push(Diagnostic::error(
-                        format!("api.tls.{field}"),
-                        format!("cannot read \"{}\": {e}", p.display()),
-                    ));
-                }
+                check_readable(&mut d, format!("api.tls.{field}"), p);
             }
         }
     }
@@ -475,6 +460,29 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
     }
 
     d
+}
+
+/// Cert/key readability check for `-t`. A missing file (or bad path) is a real
+/// config error. A *permission* error is only a WARNING: the running service
+/// reads certs via `CAP_DAC_READ_SEARCH` (see the systemd unit in install.sh),
+/// so `-t` run as a user without that capability can be denied a file the
+/// service will read fine — flagging that as an error would be a false alarm.
+fn check_readable(d: &mut Vec<Diagnostic>, field: String, p: &std::path::Path) {
+    if let Err(e) = std::fs::File::open(p) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            d.push(Diagnostic::warning(
+                field,
+                format!(
+                    "permission denied reading \"{}\" — the service reads certs via \
+                     CAP_DAC_READ_SEARCH, so this may still work at runtime; \
+                     ensure the file exists and is readable by root",
+                    p.display()
+                ),
+            ));
+        } else {
+            d.push(Diagnostic::error(field, format!("cannot read \"{}\": {e}", p.display())));
+        }
+    }
 }
 
 /// Human-readable mode name for diagnostics (matches the YAML spelling).
