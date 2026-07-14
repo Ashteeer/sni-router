@@ -50,11 +50,27 @@ pub fn check(force: bool) -> Result<Plan, String> {
     let tag = latest_tag()?; // e.g. "v1.4.0"
     let latest = tag.strip_prefix('v').unwrap_or(&tag).to_string();
     let current = current_version().to_string();
-    if !force && latest == current {
+    // Only move when the release is strictly newer; `--force` reinstalls the
+    // latest regardless (e.g. to downgrade a dev build to a published one).
+    if !force && semver(&latest) <= semver(&current) {
         Ok(Plan::AlreadyLatest { version: current })
     } else {
         Ok(Plan::Available { from: current, to: latest, tag, arch })
     }
+}
+
+/// Best-effort `x.y.z` → comparable tuple. Non-numeric or missing parts read as
+/// 0, so a malformed tag never panics — it just sorts low.
+fn semver(v: &str) -> (u64, u64, u64) {
+    let mut it = v.split('.').map(|p| {
+        p.trim()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap_or("")
+            .parse::<u64>()
+            .unwrap_or(0)
+    });
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
 }
 
 /// Download the release `tag` for `arch`, then atomically replace the running
@@ -221,4 +237,20 @@ fn scratch_dir() -> Result<PathBuf, String> {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).map_err(|e| format!("cannot create temp dir: {e}"))?;
     Ok(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::semver;
+
+    #[test]
+    fn version_ordering() {
+        assert!(semver("1.4.0") > semver("1.3.0"));
+        assert!(semver("1.10.0") > semver("1.9.0")); // numeric, not lexicographic
+        assert!(semver("2.0.0") > semver("1.9.9"));
+        assert_eq!(semver("1.4.0"), semver("1.4.0"));
+        assert!(semver("v1.4.0".trim_start_matches('v')) == semver("1.4.0"));
+        // malformed never panics, sorts low
+        assert_eq!(semver("garbage"), (0, 0, 0));
+    }
 }
