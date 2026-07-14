@@ -1,16 +1,14 @@
 //! Prometheus-compatible metrics.
 //!
 //! Counters are plain atomics (shared across all per-core workers, like the
-//! balancing counters). The exporter is a tiny **blocking** HTTP server on its
-//! own system thread — deliberately off the io_uring data path, and with no
-//! tokio in sight (same reasoning as the admin API being hand-rolled).
+//! balancing counters). [`render`] produces the Prometheus text; it's served by
+//! the unified API handler at `GET /metrics` (same bind + token as the rest of
+//! the control plane), so there's no separate exporter thread or port.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Process-wide counters. `conns_active` is a gauge (inc/dec); the rest are
 /// monotonic counters.
@@ -73,6 +71,12 @@ pub fn backend(name: &str) -> Arc<Backend> {
 fn started() -> Instant {
     static S: OnceLock<Instant> = OnceLock::new();
     *S.get_or_init(Instant::now)
+}
+
+/// Pin the process start instant so `sni_router_uptime_seconds` counts from
+/// startup, not from the first `/metrics` scrape. Call once at boot.
+pub fn init() {
+    started();
 }
 
 /// Render the current metrics in Prometheus text exposition format.
@@ -150,48 +154,4 @@ pub fn render() -> String {
 /// Escape a Prometheus label value (backslash, double-quote, newline).
 fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
-}
-
-/// Spawn the blocking metrics HTTP server on a dedicated system thread.
-pub fn spawn(bind: String) {
-    started(); // pin the start instant now
-    std::thread::spawn(move || {
-        let listener = match std::net::TcpListener::bind(&bind) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(bind = %bind, error = %e, "metrics: bind failed");
-                return;
-            }
-        };
-        tracing::info!(bind = %bind, "metrics exporter listening on /metrics");
-        for stream in listener.incoming() {
-            match stream {
-                Ok(mut s) => {
-                    let _ = serve_one(&mut s);
-                }
-                Err(_) => continue,
-            }
-        }
-    });
-}
-
-fn serve_one(s: &mut TcpStream) -> std::io::Result<()> {
-    s.set_read_timeout(Some(Duration::from_secs(5)))?;
-    // The request line fits comfortably in one read for a scraper's GET.
-    let mut buf = [0u8; 2048];
-    let n = s.read(&mut buf)?;
-    let ok = buf[..n].starts_with(b"GET /metrics ") || buf[..n].starts_with(b"GET /metrics\r");
-    let (status, ctype, body) = if ok {
-        (200u16, "text/plain; version=0.0.4; charset=utf-8", render())
-    } else {
-        (404u16, "text/plain", "not found\n".to_string())
-    };
-    let reason = if status == 200 { "OK" } else { "Not Found" };
-    let resp = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    s.write_all(resp.as_bytes())?;
-    Ok(())
 }

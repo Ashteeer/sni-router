@@ -119,9 +119,6 @@ fn main() -> ExitCode {
     }
 
     logging::init(&cfg.log);
-    if let Some(m) = &cfg.metrics {
-        metrics::spawn(m.bind.clone());
-    }
 
     match server::run(cfg, path) {
         Ok(()) => ExitCode::SUCCESS,

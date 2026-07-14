@@ -71,7 +71,7 @@ pub enum Applied {
     /// downtime; live connections are unaffected.
     HotSwapped,
     /// The change touches something baked in at process start (listener
-    /// bind/proto, a terminate backend's TLS, `default_tls`, admin/metrics/log).
+    /// bind/proto, a terminate backend's TLS, `default_tls`, api/log).
     /// The caller should [`fast_restart`] to apply it (drops connections).
     RestartRequired,
 }
@@ -96,10 +96,10 @@ impl Shared {
 
 /// Signature of the config parts that are fixed for the process lifetime and
 /// therefore can't be hot-swapped: listener bind/proto, every terminate backend
-/// (baked into an immutable `TerminateCtx`), `default_tls`, and the admin /
-/// metrics / log sections (bound or initialized once at startup). If this
-/// signature is unchanged, a config edit is safe to apply live. `admin.token`
-/// is `skip_serializing`, so a token-only change stays hot-swappable.
+/// (baked into an immutable `TerminateCtx`), `default_tls`, and the api / log
+/// sections (bound or initialized once at startup). If this signature is
+/// unchanged, a config edit is safe to apply live. `api.token` is
+/// `skip_serializing`, so a token-only change stays hot-swappable.
 fn restart_sig(cfg: &Config) -> String {
     use std::fmt::Write;
     let mut s = String::new();
@@ -127,8 +127,7 @@ fn restart_sig(cfg: &Config) -> String {
         }
     }
     let _ = write!(s, "DT:{:?};", serde_norway::to_string(&cfg.default_tls).ok());
-    let _ = write!(s, "AD:{:?};", serde_norway::to_string(&cfg.admin).ok());
-    let _ = write!(s, "MX:{:?};", serde_norway::to_string(&cfg.metrics).ok());
+    let _ = write!(s, "API:{:?};", serde_norway::to_string(&cfg.api).ok());
     let _ = write!(s, "LOG:{:?};", serde_norway::to_string(&cfg.log).ok());
     s
 }
@@ -150,6 +149,7 @@ fn build_state(cfg: Config) -> State {
 
 /// Run the router until killed. Blocks the calling thread.
 pub fn run(cfg: Config, config_path: PathBuf) -> io::Result<()> {
+    metrics::init();
     let (terminate, cert_watch) = crate::terminate::TerminateCtx::build_all(&cfg);
     crate::terminate::spawn_cert_watcher(cert_watch);
 
@@ -203,14 +203,15 @@ fn worker(core: usize, shared: Arc<Shared>) {
     rt.block_on(async move {
         let mut tasks = Vec::new();
 
-        // Admin API: a single control-plane listener, only on core 0. Served
-        // over TLS when admin.tls / default_tls supplies a cert, else plaintext.
+        // Management + metrics API: a single control-plane listener, only on
+        // core 0. Served over TLS when api.tls / default_tls supplies a cert,
+        // else plaintext.
         if core == 0 {
             let snap = shared.state.load_full();
-            if let Some(admin) = &snap.cfg.admin {
+            if let Some(api) = &snap.cfg.api {
                 // With TLS misconfigured we skip the listener rather than expose
                 // the write API in plaintext by accident.
-                let acceptor = match snap.cfg.effective_admin_tls() {
+                let acceptor = match snap.cfg.effective_api_tls() {
                     Some(tls) => match crate::terminate::build_acceptor(tls) {
                         Ok(a) => Ok(Some(a)),
                         Err(e) => Err(e),
@@ -218,16 +219,16 @@ fn worker(core: usize, shared: Arc<Shared>) {
                     None => Ok(None),
                 };
                 match acceptor {
-                    Err(e) => tracing::error!(error = %e, "admin TLS setup failed; API disabled"),
-                    Ok(acceptor) => match TcpListener::bind(admin.bind.as_str()) {
+                    Err(e) => tracing::error!(error = %e, "api TLS setup failed; API disabled"),
+                    Ok(acceptor) => match TcpListener::bind(api.bind.as_str()) {
                         Ok(l) => {
                             let scheme = if acceptor.is_some() { "https" } else { "http" };
-                            tracing::info!(bind = %admin.bind, scheme, "admin API listening");
+                            tracing::info!(bind = %api.bind, scheme, "management API listening");
                             let sh = shared.clone();
                             tasks.push(monoio::spawn(crate::admin::serve(l, sh, acceptor)));
                         }
                         Err(e) => {
-                            tracing::error!(bind = %admin.bind, error = %e, "admin bind failed")
+                            tracing::error!(bind = %api.bind, error = %e, "api bind failed")
                         }
                     },
                 }
@@ -701,7 +702,7 @@ fn reload(shared: &Shared) {
             // PID for systemd. Config is already validated, so the new image
             // will start cleanly.
             tracing::warn!(
-                "reload: non-hot-swappable change (listeners/TLS/admin/metrics/log) — \
+                "reload: non-hot-swappable change (listeners/TLS/api/log) — \
                  fast-restarting to apply (active connections will drop)"
             );
             fast_restart();

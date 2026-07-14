@@ -19,18 +19,21 @@ pub const CONFIG_ENV_VAR: &str = "SNI_ROUTER_CONFIG";
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Empty is valid: an API-only config that carries no routing yet (a web UI
+    /// fills in listeners/backends later via `PUT /config`).
+    #[serde(default)]
     pub listeners: Vec<Listener>,
+    #[serde(default)]
     pub backends: BTreeMap<String, Backend>,
     #[serde(default)]
     pub timeouts: Timeouts,
     #[serde(default)]
     pub limits: Limits,
-    /// Optional read-only admin/REST API (foundation for a future web UI).
+    /// Unified management + metrics API: one `IP:port`, one token. Serves the
+    /// control plane (config read/write, reload, restart) and `GET /metrics`.
+    /// Foundation for a web UI.
     #[serde(default)]
-    pub admin: Option<Admin>,
-    /// Optional Prometheus metrics exporter.
-    #[serde(default)]
-    pub metrics: Option<MetricsExporter>,
+    pub api: Option<Api>,
     /// Logging configuration.
     #[serde(default)]
     pub log: Log,
@@ -49,23 +52,14 @@ impl Config {
         b.tls.as_ref().or(self.default_tls.as_ref())
     }
 
-    /// Effective TLS cert/key for the admin API: `admin.tls` if set, else the
-    /// shared `default_tls`. `None` = serve plaintext HTTP.
-    pub fn effective_admin_tls(&self) -> Option<&Tls> {
-        self.admin
+    /// Effective TLS cert/key for the API: `api.tls` if set, else the shared
+    /// `default_tls`. `None` = serve plaintext HTTP.
+    pub fn effective_api_tls(&self) -> Option<&Tls> {
+        self.api
             .as_ref()
             .and_then(|a| a.tls.as_ref())
             .or(self.default_tls.as_ref())
     }
-}
-
-/// Prometheus-compatible metrics exporter. Served by a tiny blocking HTTP
-/// server on its own system thread, off the io_uring data path.
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct MetricsExporter {
-    /// Address to serve `GET /metrics` on, e.g. `127.0.0.1:9100`.
-    pub bind: String,
 }
 
 /// Logging: level and output format.
@@ -93,24 +87,24 @@ pub enum LogFormat {
     Json,
 }
 
-/// Admin HTTP API. Reads: `GET /status`, `GET /config`, `GET /healthz`.
-/// Writes (require a configured `token`): `PUT /config`, `POST /reload`,
-/// `POST /restart`.
+/// Unified management + metrics HTTP API. One bind, one token guards every
+/// endpoint. Reads: `GET /status`, `GET /config`, `GET /healthz`,
+/// `GET /metrics`. Writes: `PUT /config`, `POST /reload`, `POST /restart`.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Admin {
-    /// Address to serve the admin API on, e.g. `127.0.0.1:9000`. Keep it on a
-    /// loopback / trusted interface (or serve it over TLS, see `tls`).
+pub struct Api {
+    /// Address to serve the API on, e.g. `0.0.0.0:9000`. Reachable by a remote
+    /// web UI; protect it with a `token` (and ideally `tls`).
     pub bind: String,
-    /// Optional bearer token; when set, requests must send
+    /// Bearer token; when set, **every** request (reads and writes) must send
     /// `Authorization: Bearer <token>`. Never echoed back by `GET /config`.
     /// **Required for the write endpoints** — without it they return 403, so
     /// the config can't be changed unauthenticated.
     #[serde(default, skip_serializing)]
     pub token: Option<String>,
-    /// Serve the admin API over HTTPS with this cert/key. If omitted, the
-    /// top-level `default_tls` is used; if neither is set, the API is plaintext
-    /// HTTP. A cert change is picked up on the next restart (not hot-reloaded).
+    /// Serve the API over HTTPS with this cert/key. If omitted, the top-level
+    /// `default_tls` is used; if neither is set, the API is plaintext HTTP.
+    /// A cert change is picked up on the next restart (not hot-reloaded).
     #[serde(default)]
     pub tls: Option<Tls>,
 }

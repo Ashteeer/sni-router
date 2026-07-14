@@ -47,14 +47,13 @@ your config with `sni-router -t` first.
 | Re-encrypt to TLS backends (`backend_tls`) + mTLS | done |
 | Access control (allow/deny by client IP CIDR and SNI) | done |
 | QUIC v2 (RFC 9369) Initial decryption | done |
-| Read-only admin/REST API (`/status`, `/config`, `/healthz`) | done |
+| Management + metrics API — one bind, one token (`/status`, `/config`, `/healthz`, `/metrics`, `PUT`/`POST` writes) | done |
 | Zero-downtime cert reload (certbot/lego renewals) | done |
 | Backend health checks (TCP probe) + connect retry across the pool | done |
 | Zero-copy `splice()` TCP forwarding | done |
 | WebSocket / HTTP Upgrade tunneling in terminate mode | done |
 | Hot reload on SIGHUP (validate first, keep old config on failure) | done |
 | Structured access logs + `tracing` (text/json) | done |
-| Prometheus metrics endpoint (`/metrics`, global + per-backend) | done |
 | Rate limiting (`max_conns_per_ip`) | done |
 | Graceful drain on SIGTERM | done |
 | `:80`→`:443` redirect (`mode: redirect_https`) | done |

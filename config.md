@@ -22,15 +22,20 @@ be generated and edited programmatically and by non-DevOps users.
 ## 1. Top-level structure
 
 ```yaml
-listeners:   [ ... ]   # required, >= 1  — how clients are accepted
-backends:    { ... }   # required, >= 1  — how the router talks to servers
+listeners:   [ ... ]   # optional        — how clients are accepted
+backends:    { ... }   # optional        — how the router talks to servers
 default_tls: { ... }   # optional        — shared cert for terminate backends
 timeouts:    { ... }   # optional        — global timeouts (seconds)
 limits:      { ... }   # optional        — resource limits
 log:         { ... }   # optional        — logging
-metrics:     { ... }   # optional        — Prometheus exporter
-admin:       { ... }   # optional        — REST API (config read + write, restart)
+api:         { ... }   # optional        — management + metrics API (one bind, one token)
 ```
+
+`listeners` and `backends` may be empty (or omitted): an **API-only config** is
+valid — it exposes just the management API, and a web UI fills in the routing
+later via `PUT /config`. This is exactly what the installer writes. (If both are
+empty *and* there's no `api` section, validation fails — the router would have
+nothing to do.) Once you add a listener, it needs at least one backend.
 
 `default_tls` is a single `{ cert, key }` object. Any `terminate`/`terminate_tcp`
 backend that omits its own `tls` uses it — so many backends can share one
@@ -336,45 +341,37 @@ backend, mode, bytes, duration). Color is used only when stderr is a terminal.
 
 ---
 
-## 8. `metrics` (object, optional)
+## 8. `api` (object, optional)
 
-| field  | type   | required | notes |
-|--------|--------|----------|-------|
-| `bind` | string | yes      | `IP:port` to serve `GET /metrics` (Prometheus text) |
-
-Served by a small blocking HTTP server on its own thread. Keep it on a trusted
-interface. Exposes global counters (connections, bytes, errors, rate‑limited,
-UDP flows) and per‑backend series.
-
----
-
-## 9. `admin` (object, optional)
-
-REST API and control plane (foundation for a web UI). Runs on one core.
+Unified management + metrics API and control plane (foundation for a web UI).
+**One bind, one token** — the same address and token guard config read/write,
+reload/restart, and the Prometheus metrics. Runs on one core, off the data path.
+This is the only section the installer writes by default; it auto‑generates
+`bind` (`0.0.0.0:<random free port>`) and `token`.
 
 | field   | type   | required | notes |
 |---------|--------|----------|-------|
-| `bind`  | string | yes      | `IP:port`; keep on loopback/trusted interface (or serve over TLS, see `tls`) |
-| `token` | string | no       | if set, requests must send `Authorization: Bearer <token>`; never echoed by `/config`. **Required for the write endpoints.** |
+| `bind`  | string | yes      | `IP:port`. `0.0.0.0:<port>` to reach it from a remote web UI; protect it with a `token` (and ideally `tls`). |
+| `token` | string | no       | if set, **every** request (reads *and* writes) must send `Authorization: Bearer <token>`; never echoed by `/config`. **Required for the write endpoints.** |
 | `tls`   | object | no       | `{ cert, key }` to serve the API over HTTPS. If omitted, `default_tls` is used; if neither is set, the API is plaintext HTTP. A cert change is applied on the next restart (not hot‑reloaded). |
 
-### 9.1 Endpoints
+### 8.1 Endpoints
 
-Reads (allowed without a token, unless a token is configured — then all requests
-need it):
+Reads (need the token when one is configured — the installer always sets one):
 
 | method + path   | returns | notes |
 |-----------------|---------|-------|
 | `GET /healthz`  | `ok`    | liveness |
 | `GET /status`   | JSON    | version, uptime, listeners, backends |
-| `GET /config`   | YAML    | the running config; `admin.token` redacted |
+| `GET /config`   | YAML    | the running config; `api.token` redacted |
+| `GET /metrics`  | text    | Prometheus exposition: global counters (connections, bytes, errors, rate‑limited, UDP flows) and per‑backend series |
 
-Writes (**require `admin.token`** — without it they return `403`, so the config
+Writes (**require `api.token`** — without it they return `403`, so the config
 can't be changed unauthenticated):
 
 | method + path   | body        | effect |
 |-----------------|-------------|--------|
-| `PUT /config`   | YAML config | validate → atomically replace the config file → apply. Invalid config → `400` with a JSON error list, **nothing is written**. The body **must include `admin.token`** while one is configured (`GET /config` redacts it, so a blind GET→PUT round‑trip is rejected with `400` instead of silently disabling auth). |
+| `PUT /config`   | YAML config | validate → atomically replace the config file → apply. Invalid config → `400` with a JSON error list, **nothing is written**. The body **must include `api.token`** while one is configured (`GET /config` redacts it, so a blind GET→PUT round‑trip is rejected with `400` instead of silently disabling auth). |
 | `POST /reload`  | —           | re‑read the config file from disk and apply it (like SIGHUP). |
 | `POST /restart` | —           | validate the on‑disk config, then re‑exec the process (drops connections, rebinds immediately). Privilege‑free equivalent of `systemctl restart`. |
 
@@ -389,9 +386,9 @@ can't be changed unauthenticated):
 change to routes, ACLs, timeouts, limits, or passthrough/redirect backends
 (including their server lists) is applied live. A change to a listener's
 `bind`/`proto`, a `terminate`/`terminate_tcp` backend's TLS/headers/http2/
-http_rules, `default_tls`, or the `admin`/`metrics`/`log` sections requires a
-restart — `PUT`/`POST` perform it automatically and report `"applied":"restart"`.
-(`admin.token` alone is hot‑swappable.)
+http_rules, `default_tls`, or the `api`/`log` sections requires a restart —
+`PUT`/`POST` perform it automatically and report `"applied":"restart"`.
+(`api.token` alone is hot‑swappable.)
 
 A validation error body:
 
@@ -402,7 +399,7 @@ A validation error body:
 > **Writable config file.** `PUT /config` rewrites the config on disk, so the
 > service process must have write access to it. The installer creates a static
 > `sni-router` system user that owns `/etc/sni-router` (0750, config 0600 — it
-> holds the admin token) and runs the service as that user. (`DynamicUser`
+> holds the api token) and runs the service as that user. (`DynamicUser`
 > doesn't work here: systemd does not chown an existing config directory to the
 > dynamic user.) Under snap the config lives in `$SNAP_DATA` (already writable
 > by the root daemon).
@@ -428,7 +425,7 @@ Errors (exit non‑zero):
 10. `servers` non‑empty for every mode except `redirect_https`.
 11. `udp` listeners route only to `passthrough` backends.
 12. Timeouts `> 0`; `max_client_hello ≥ 512`; valid `log.level`; valid
-    `metrics.bind`/`admin.bind`.
+    `api.bind`.
 
 Warnings (still exit `0`):
 
@@ -454,9 +451,9 @@ TCP connect to each server (opt‑in side effect).
   as the quick "restart now" instead of stop+start.
 - **SIGTERM/SIGINT**: graceful shutdown — stop accepting new connections, wait up
   to `timeouts.drain` seconds for active ones to finish, then exit.
-- **Admin API**: `PUT /config` / `POST /reload` apply changes the same way as
-  SIGHUP (hot‑swap or restart, reported in the response); `POST /restart` forces
-  a re‑exec. See [§9.1](#91-endpoints).
+- **API**: `PUT /config` / `POST /reload` apply changes the same way as SIGHUP
+  (hot‑swap or restart, reported in the response); `POST /restart` forces a
+  re‑exec. See [§8.1](#81-endpoints).
 
 ---
 
@@ -560,14 +557,13 @@ backends:
 
 ```
 Config {
-  listeners: Listener[]                       // >= 1
-  backends: { [name: string]: Backend }       // >= 1
+  listeners?: Listener[]                      // may be empty (API-only config)
+  backends?: { [name: string]: Backend }      // may be empty (API-only config)
   default_tls?: { cert: string, key: string } // shared cert for terminate backends
   timeouts?: { handshake, connect, idle, health_interval, drain }   // ints, seconds
   limits?: { max_client_hello, max_conns_per_ip }                   // ints
   log?: { level: enum, format: enum }
-  metrics?: { bind: string }
-  admin?: { bind: string, token?: string, tls?: { cert: string, key: string } }
+  api?: { bind: string, token?: string, tls?: { cert: string, key: string } }
 }
 
 Listener {

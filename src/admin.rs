@@ -1,12 +1,15 @@
-//! Admin / REST API — the control plane for a future web UI.
+//! Unified management + metrics API — the control plane for a web UI.
 //!
-//! Reads: `GET /status` (JSON), `GET /config` (YAML), `GET /healthz`.
-//! Writes (require a configured `admin.token`): `PUT /config` (replace the
+//! Reads: `GET /status` (JSON), `GET /config` (YAML), `GET /healthz`,
+//! `GET /metrics` (Prometheus text).
+//! Writes (require a configured `api.token`): `PUT /config` (replace the
 //! config file), `POST /reload` (re-read it from disk), `POST /restart`
 //! (re-exec the process — the privilege-free equivalent of a service restart).
 //!
-//! Runs on a single core (not reuseport) since it's a control plane, not a data
-//! path. Optionally served over TLS (`admin.tls` / `default_tls`).
+//! One bind, one token: when `api.token` is set every endpoint (metrics
+//! included) requires it. Runs on a single core (not reuseport) since it's a
+//! control plane, not a data path. Optionally served over TLS (`api.tls` /
+//! `default_tls`).
 
 use crate::config::{Mode, Proto};
 use crate::server::{Applied, Shared};
@@ -84,7 +87,7 @@ where
     let path = parts.next().unwrap_or("");
 
     let state = shared.state.load_full();
-    let token = state.cfg.admin.as_ref().and_then(|a| a.token.as_deref());
+    let token = state.cfg.api.as_ref().and_then(|a| a.token.as_deref());
     let is_write = matches!(method, "PUT" | "POST");
 
     // Writes are gated behind a configured token: without one they are refused,
@@ -95,7 +98,7 @@ where
             403,
             "Forbidden",
             "application/json",
-            b"{\"error\":\"write endpoints require admin.token to be configured\"}\n",
+            b"{\"error\":\"write endpoints require api.token to be configured\"}\n",
         )
         .await;
     }
@@ -116,9 +119,14 @@ where
             respond(&mut s, 200, "OK", "application/json", body.as_bytes()).await
         }
         ("GET", "/config") => {
-            // The admin token is `skip_serializing`, so it never appears here.
+            // The api token is `skip_serializing`, so it never appears here.
             let body = serde_norway::to_string(&state.cfg).unwrap_or_default();
             respond(&mut s, 200, "OK", "application/yaml", body.as_bytes()).await
+        }
+        ("GET", "/metrics") => {
+            let body = crate::metrics::render();
+            respond(&mut s, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body.as_bytes())
+                .await
         }
         ("PUT", "/config") => put_config(&mut s, &shared, &head, &buf, head_end).await,
         ("POST", "/reload") => reload(&mut s, &shared).await,
@@ -189,7 +197,7 @@ where
         return respond(s, 400, "Bad Request", "application/json", body.as_bytes()).await;
     }
 
-    // GET /config redacts admin.token, so a GET → edit → PUT round-trip would
+    // GET /config redacts api.token, so a GET → edit → PUT round-trip would
     // silently strip the token from the file, leaving the API unauthenticated
     // after the next restart. Refuse that; removing auth deliberately means
     // editing the file on disk.
@@ -197,12 +205,12 @@ where
         .state
         .load()
         .cfg
-        .admin
+        .api
         .as_ref()
         .is_some_and(|a| a.token.is_some());
-    if cur_token_set && cfg.admin.as_ref().is_some_and(|a| a.token.is_none()) {
+    if cur_token_set && cfg.api.as_ref().is_some_and(|a| a.token.is_none()) {
         return respond(s, 400, "Bad Request", "application/json",
-            b"{\"error\":\"admin.token is missing (GET /config redacts it) - include the token in the body, or remove it by editing the file on disk\"}\n").await;
+            b"{\"error\":\"api.token is missing (GET /config redacts it) - include the token in the body, or remove it by editing the file on disk\"}\n").await;
     }
 
     // Write atomically (temp + rename) so a crash mid-write can't corrupt it.

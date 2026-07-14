@@ -37,9 +37,19 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
     let mut d = Vec::new();
 
     if cfg.listeners.is_empty() {
-        d.push(Diagnostic::error("listeners", "at least one listener is required"));
+        // An API-only config (no routing yet, filled in later via the API) is
+        // valid as long as the API is what's being served. Otherwise there's
+        // nothing to do.
+        if cfg.api.is_none() {
+            d.push(Diagnostic::error(
+                "listeners",
+                "no listeners and no api section — nothing to do; add a listener or an `api` section",
+            ));
+        }
     }
-    if cfg.backends.is_empty() {
+    // Backends are only required once there are listeners routing to them;
+    // referential integrity below flags any route pointing at a missing one.
+    if !cfg.listeners.is_empty() && cfg.backends.is_empty() {
         d.push(Diagnostic::error("backends", "at least one backend is required"));
     }
 
@@ -408,53 +418,35 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         }
     }
 
-    // Admin API bind address + optional TLS cert.
-    if let Some(admin) = &cfg.admin {
-        match admin.bind.parse::<SocketAddr>() {
+    // Management + metrics API bind address + optional TLS cert.
+    if let Some(api) = &cfg.api {
+        match api.bind.parse::<SocketAddr>() {
             Err(_) => {
                 d.push(Diagnostic::error(
-                    "admin.bind",
-                    format!("invalid address \"{}\" — expected IP:port", admin.bind),
+                    "api.bind",
+                    format!("invalid address \"{}\" — expected IP:port", api.bind),
                 ));
             }
             Ok(addr) if !addr.ip().is_loopback() => {
-                if cfg.effective_admin_tls().is_none() {
+                if api.token.is_none() {
                     d.push(Diagnostic::warning(
-                        "admin.bind",
-                        "admin API on a non-loopback address without TLS — the token and \
-                         config travel in plaintext; set admin.tls / default_tls or bind to \
-                         127.0.0.1",
-                    ));
-                }
-                if admin.token.is_none() {
-                    d.push(Diagnostic::warning(
-                        "admin.token",
-                        "admin API on a non-loopback address without a token — /status and \
-                         /config are readable by anyone who can reach it",
+                        "api.token",
+                        "API on a non-loopback address without a token — anyone who can reach \
+                         it can read /config and change the running config",
                     ));
                 }
             }
             Ok(_) => {}
         }
-        if let Some(t) = &admin.tls {
+        if let Some(t) = &api.tls {
             for (field, p) in [("cert", &t.cert), ("key", &t.key)] {
                 if let Err(e) = std::fs::File::open(p) {
                     d.push(Diagnostic::error(
-                        format!("admin.tls.{field}"),
+                        format!("api.tls.{field}"),
                         format!("cannot read \"{}\": {e}", p.display()),
                     ));
                 }
             }
-        }
-    }
-
-    // Metrics exporter bind address.
-    if let Some(m) = &cfg.metrics {
-        if m.bind.parse::<SocketAddr>().is_err() {
-            d.push(Diagnostic::error(
-                "metrics.bind",
-                format!("invalid address \"{}\" — expected IP:port", m.bind),
-            ));
         }
     }
 
