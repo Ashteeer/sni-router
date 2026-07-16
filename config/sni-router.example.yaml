@@ -9,6 +9,9 @@ listeners:
       - "0.0.0.0:443"
       - "[::]:443"
     proto: tcp                  # tcp | udp (udp = QUIC passthrough)
+    # fast_open: true           # accept TCP Fast Open (tcp only): returning
+                                # clients send the ClientHello in the SYN, saving
+                                # an RTT. Needs sysctl net.ipv4.tcp_fastopen=3.
     # Optional access control (deny wins; an empty allow list means "any").
     # acl:
     #   allow_ip: ["10.0.0.0/8", "192.168.1.5"]

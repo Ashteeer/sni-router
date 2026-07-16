@@ -120,6 +120,12 @@ pub struct Listener {
     pub bind: Vec<String>,
     #[serde(default)]
     pub proto: Proto,
+    /// Accept TCP Fast Open connections (`TCP_FASTOPEN`), letting returning
+    /// clients send the ClientHello inside the SYN. `proto: tcp` only; requires
+    /// `net.ipv4.tcp_fastopen` to have the server bit set (sysctl 2 or 3).
+    /// Outgoing connections to backends are unaffected.
+    #[serde(default)]
+    pub fast_open: bool,
     /// Optional access control for this listener (by client IP and/or SNI).
     #[serde(default)]
     pub acl: Option<AclConfig>,

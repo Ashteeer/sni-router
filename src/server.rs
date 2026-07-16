@@ -106,7 +106,7 @@ fn restart_sig(cfg: &Config) -> String {
     for l in &cfg.listeners {
         let mut binds = l.bind.clone();
         binds.sort();
-        let _ = write!(s, "L:{}:{:?}:{:?};", l.name, l.proto, binds);
+        let _ = write!(s, "L:{}:{:?}:{:?}:{};", l.name, l.proto, binds, l.fast_open);
     }
     // For terminate backends only the parts baked into the immutable
     // TerminateCtx matter (cert, re-encrypt, headers, http2, http_rules, mode) —
@@ -245,7 +245,7 @@ fn worker(core: usize, shared: Arc<Shared>) {
                     Err(_) => continue, // validated already
                 };
                 match l.proto {
-                    Proto::Tcp => match reuseport_tcp(addr) {
+                    Proto::Tcp => match reuseport_tcp(addr, l.fast_open) {
                         Ok(std_l) => match TcpListener::from_std(std_l) {
                             Ok(listener) => {
                                 let sh = shared.clone();
@@ -1073,10 +1073,35 @@ fn dummy_udp() -> UdpSocket {
 // Socket setup
 // ---------------------------------------------------------------------------
 
-fn reuseport_tcp(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+fn reuseport_tcp(addr: SocketAddr, fast_open: bool) -> io::Result<std::net::TcpListener> {
     let sock = new_reuseport_socket(addr, Type::STREAM, SockProto::TCP)?;
+    if fast_open {
+        set_tcp_fastopen(&sock)?;
+    }
     sock.listen(1024)?;
     Ok(sock.into())
+}
+
+/// Enable TCP Fast Open on a listening socket. Must be set before `listen()`.
+/// The value is the SYN-queue length for connections still to be validated;
+/// it mirrors the listen backlog. socket2 0.5 has no wrapper for this option.
+fn set_tcp_fastopen(sock: &Socket) -> io::Result<()> {
+    let qlen: libc::c_int = 1024;
+    // SAFETY: fd is owned by `sock` and outlives the call; qlen is a valid
+    // c_int of the size we pass.
+    let rc = unsafe {
+        libc::setsockopt(
+            std::os::unix::io::AsRawFd::as_raw_fd(sock),
+            libc::IPPROTO_TCP,
+            libc::TCP_FASTOPEN,
+            &qlen as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn reuseport_udp(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {

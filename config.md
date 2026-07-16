@@ -65,6 +65,7 @@ Each listener:
 | `name`  | string            | yes      | —       | unique across listeners; label only |
 | `bind`  | array of string   | yes      | —       | one or more `IP:port` accept addresses |
 | `proto` | `tcp` \| `udp`    | no       | `tcp`   | `udp` = QUIC passthrough |
+| `fast_open` | bool          | no       | `false` | accept TCP Fast Open; `tcp` only; see [fast_open](#22-fast_open) |
 | `acl`   | object            | no       | none    | see [ACL](#26-acl) |
 | `routes`| array of route    | yes      | —       | first match wins; see [routes](#25-routes) |
 
@@ -79,6 +80,27 @@ Each listener:
   (even across listeners) is an **error**.
 - Changing `bind`/`proto` requires a process restart; a SIGHUP reload rejects
   such a change and keeps the running config.
+
+### 2.2 `fast_open`
+
+`fast_open: true` sets `TCP_FASTOPEN` on the listening sockets, so a returning
+client can carry its TLS ClientHello inside the SYN — the router extracts the
+SNI and routes without waiting for the handshake to complete, saving one RTT.
+
+- **`proto: tcp` only.** `fast_open: true` on a `udp` listener is a config
+  **error** (QUIC already does 0‑RTT itself).
+- **Listener‑side only.** There is no backend switch: the kernel decides on its
+  own whether outgoing connections use TFO.
+- **Requires the kernel's server bit:** `net.ipv4.tcp_fastopen` must be `3`.
+  `-t` emits a **WARNING** (not an error) if it isn't — the service still
+  starts, TFO is simply inactive and clients fall back to a normal handshake.
+  Persist it in `/etc/sysctl.d/`:
+
+  ```
+  net.ipv4.tcp_fastopen = 3
+  ```
+- Changing `fast_open` requires a restart (same as `bind`/`proto`) — a SIGHUP
+  triggers a fast in-place restart, since the option is set before `listen()`.
 
 ### 2.5 `routes`
 
@@ -405,7 +427,7 @@ version.
 **When a restart is needed vs. zero‑downtime hot‑swap** (same rule as SIGHUP): a
 change to routes, ACLs, timeouts, limits, or passthrough/redirect backends
 (including their server lists) is applied live. A change to a listener's
-`bind`/`proto`, a `terminate`/`terminate_tcp` backend's TLS/headers/http2/
+`bind`/`proto`/`fast_open`, a `terminate`/`terminate_tcp` backend's TLS/headers/http2/
 http_rules, `default_tls`, or the `api`/`log` sections requires a restart —
 `PUT`/`POST` perform it automatically and report `"applied":"restart"`.
 (`api.token` alone is hot‑swappable.)
@@ -445,13 +467,16 @@ Errors (exit non‑zero):
 9. `http_rules`: `path` non‑empty; `respond` has a valid `status` (100–599);
    `redirect` has `to` (`https` or an absolute URL) and a 3xx `status` if set.
 10. `servers` non‑empty for every mode except `redirect_https`.
-11. `udp` listeners route only to `passthrough` backends.
+11. `udp` listeners route only to `passthrough` backends, and don't set
+    `fast_open`.
 12. Timeouts `> 0`; `max_client_hello ≥ 512`; valid `log.level`; valid
     `api.bind`.
 
 Warnings (still exit `0`):
 
 - Unreachable (shadowed) routes.
+- `fast_open: true` while `net.ipv4.tcp_fastopen` is not `3` (TFO stays
+  inactive; the service starts anyway).
 - Fields set but ignored for the chosen mode (see the applicability matrix).
 - A backend not referenced by any route.
 - Unusually large timeouts / buffer sizes.
@@ -466,7 +491,7 @@ TCP connect to each server (opt‑in side effect).
 - **SIGHUP**: re‑reads and validates the file. On any error the old config keeps
   serving. Applies changes to routes/backends/timeouts/ACLs for **new**
   connections; live connections keep the config they started with (zero
-  downtime). If `bind`/`proto` changed, it instead **fast-restarts** in place
+  downtime). If `bind`/`proto`/`fast_open` changed, it instead **fast-restarts** in place
   (re-exec, same PID) to apply the new listeners — active connections drop.
 - **SIGUSR1**: fast restart on demand — validate the config, then re-exec in
   place, dropping all connections and rebinding immediately (no drain). Use this

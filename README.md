@@ -23,7 +23,8 @@ separate HTTP reverse proxy for termination.
 Design priorities, in order:
 
 - **Raw performance** — io_uring (`monoio`, thread-per-core), zero-copy
-  `splice()` forwarding, `SO_REUSEPORT` sharding with CPU pinning.
+  `splice()` forwarding, `SO_REUSEPORT` sharding with CPU pinning, optional
+  TCP Fast Open on listeners.
 - **TCP _and_ UDP/QUIC** out of the box, not TCP only.
 - **A config a human can read** — flat YAML, sane defaults, first-match
   routing. Closer to HAProxy than to Envoy, and simpler than both. See
@@ -52,6 +53,7 @@ your config with `sni-router -t` first.
 | Zero-downtime cert reload (certbot/lego renewals) | done |
 | Backend health checks (TCP probe) + connect retry across the pool | done |
 | Zero-copy `splice()` TCP forwarding | done |
+| TCP Fast Open on listeners (`fast_open: true`) | done |
 | WebSocket / HTTP Upgrade tunneling in terminate mode | done |
 | Hot reload on SIGHUP (validate first, keep old config on failure) | done |
 | Structured access logs + `tracing` (text/json) | done |
@@ -98,6 +100,8 @@ listeners:
   - name: main_tls
     bind: ["0.0.0.0:443", "[::]:443"]
     proto: tcp                    # tcp | udp (udp = QUIC)
+    fast_open: true               # accept TCP Fast Open (needs sysctl
+                                  # net.ipv4.tcp_fastopen=3)
     routes:                       # first match wins
       - sni: "example.com"
         backend: web_main

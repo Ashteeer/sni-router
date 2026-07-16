@@ -97,6 +97,17 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                 )),
             }
         }
+
+        if l.fast_open {
+            if l.proto != Proto::Tcp {
+                d.push(Diagnostic::error(
+                    format!("listeners[{i}].fast_open"),
+                    "TCP Fast Open applies to proto: tcp only",
+                ));
+            } else if let Some(msg) = tcp_fastopen_sysctl_issue() {
+                d.push(Diagnostic::warning(format!("listeners[{i}].fast_open"), msg));
+            }
+        }
     }
 
     // Routes: referential integrity, udp+terminate, shadowing.
@@ -462,6 +473,21 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
     d
 }
 
+/// Returns a warning message if `net.ipv4.tcp_fastopen` is not 3 (client+server
+/// enabled), i.e. the kernel will silently ignore the socket's `TCP_FASTOPEN`.
+/// Unreadable sysctl (container, non-Linux) is not flagged — we can't tell.
+fn tcp_fastopen_sysctl_issue() -> Option<String> {
+    let raw = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_fastopen").ok()?;
+    let v: u8 = raw.trim().parse().ok()?;
+    (v != 3).then(|| {
+        format!(
+            "fast_open is enabled but net.ipv4.tcp_fastopen = {v} — the kernel will not \
+             accept TFO connections; run \"sysctl -w net.ipv4.tcp_fastopen=3\" \
+             (persist in /etc/sysctl.d/). The service still starts, TFO is just inactive"
+        )
+    })
+}
+
 /// Cert/key readability check for `-t`. A missing file (or bad path) is a real
 /// config error. A *permission* error is only a WARNING: the running service
 /// reads certs via `CAP_DAC_READ_SEARCH` (see the systemd unit in install.sh),
@@ -578,6 +604,43 @@ backends:
     fn valid_config_passes() {
         let d = validate(&cfg(VALID));
         assert!(d.is_empty(), "unexpected diagnostics: {d:?}");
+    }
+
+    #[test]
+    fn fast_open_on_udp_is_an_error() {
+        let d = validate(&cfg(r#"
+listeners:
+  - name: q
+    bind: ["0.0.0.0:443"]
+    proto: udp
+    fast_open: true
+    routes:
+      - { sni: "*", backend: web }
+backends:
+  web:
+    servers: ["10.0.0.1:443"]
+"#));
+        let e = errors(&d);
+        assert_eq!(e.len(), 1, "{d:?}");
+        assert_eq!(e[0].path, "listeners[0].fast_open");
+    }
+
+    #[test]
+    fn fast_open_on_tcp_is_never_an_error() {
+        // Sysctl-dependent, so only assert it can't block startup.
+        let d = validate(&cfg(r#"
+listeners:
+  - name: main
+    bind: ["0.0.0.0:443"]
+    proto: tcp
+    fast_open: true
+    routes:
+      - { sni: "*", backend: web }
+backends:
+  web:
+    servers: ["10.0.0.1:443"]
+"#));
+        assert!(errors(&d).is_empty(), "{d:?}");
     }
 
     #[test]
