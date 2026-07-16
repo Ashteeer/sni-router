@@ -118,6 +118,7 @@ unless a counter says otherwise — the defaults are sized for a reconnect burst
 | set by | `listen(2)` | `TCP_FASTOPEN` |
 | on overflow | **SYNs are dropped** — the client retries or fails | client silently falls back to a normal handshake (no failure) |
 | watch | `ss -tln` (Send-Q on the LISTEN row), `nstat -az TcpExtListenOverflows` | `nstat -az TcpExtTCPFastOpenListenOverflow` |
+| verify the value | `ss -tln` Send-Q | the startup log (see below) — **not** visible in `ss` |
 
 **Sizing.** A queue holds roughly `new_connections_per_sec × RTT` entries — it
 drains as fast as handshakes complete. At 1000 new conn/s and a 200 ms RTT that
@@ -134,6 +135,34 @@ queue only costs the client a round trip. Both are clamped by
   is a **warning** — the value is ignored.
 - Both are baked in before `listen()`, so changing either restarts in place
   (same as `bind`/`proto`).
+
+**Checking what is actually in effect.** `backlog` shows up as Send-Q on the
+LISTEN row of `ss -tln`. `fast_open_qlen` does **not** appear in `ss` at any
+verbosity — the kernel does not expose it through inet_diag — so the router
+reads it back with `getsockopt(TCP_FASTOPEN)` and logs it once per address at
+startup:
+
+```
+INFO tcp listener ready (fast_open active) addr=0.0.0.0:443 backlog=10240 fast_open_qlen=2048
+WARN fast_open_qlen was clamped by net.core.somaxconn requested=99999 effective=65535
+```
+
+That WARN is the case worth knowing about: the kernel silently clamps both
+queues to `net.core.somaxconn`, so a configured value can differ from the real
+one with nothing else to indicate it.
+
+Health of the TFO queue is in the kernel counters — `nstat -az | grep -i
+fastopen`:
+
+| counter | meaning |
+|---|---|
+| `TcpExtTCPFastOpenPassive` | connections accepted via TFO — rising means it works |
+| `TcpExtTCPFastOpenPassiveFail` | TFO attempts that failed (bad cookie, etc.) |
+| `TcpExtTCPFastOpenListenOverflow` | **the queue was full** — the only reason to raise `fast_open_qlen` |
+| `TcpExtTCPFastOpenCookieReqd` | clients asking for a cookie (first-time visitors) |
+
+Note these are host-wide, not per-listener: they cover every TFO socket on the
+machine.
 
 ### 2.5 `routes`
 

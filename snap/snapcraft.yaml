@@ -2,7 +2,7 @@ name: sni-router
 base: core24                 # Ubuntu 24.04; sni-router supports 24.04 and newer only.
 # Keep in sync with Cargo.toml [package].version AND the GitHub release tag on
 # every release (see CLAUDE.md).
-version: '1.6.0'
+version: '1.6.1'
 summary: High-performance SNI-based L4 router (TCP/UDP/QUIC)
 description: |
   sni-router routes TCP/UDP/QUIC connections by TLS SNI without terminating the

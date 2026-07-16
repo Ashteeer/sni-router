@@ -256,13 +256,23 @@ fn worker(core: usize, shared: Arc<Shared>) {
                 };
                 match l.proto {
                     Proto::Tcp => match reuseport_tcp(addr, l) {
-                        Ok(std_l) => match TcpListener::from_std(std_l) {
-                            Ok(listener) => {
-                                let sh = shared.clone();
-                                tasks.push(monoio::spawn(tcp_accept_loop(listener, addr, idx, sh)));
+                        Ok(std_l) => {
+                            // One report per address, not per reuseport worker.
+                            if core == 0 {
+                                log_listener(addr, l, std::os::fd::AsRawFd::as_raw_fd(&std_l));
                             }
-                            Err(e) => tracing::error!(core, %addr, error = %e, "tcp from_std failed"),
-                        },
+                            match TcpListener::from_std(std_l) {
+                                Ok(listener) => {
+                                    let sh = shared.clone();
+                                    tasks.push(monoio::spawn(tcp_accept_loop(
+                                        listener, addr, idx, sh,
+                                    )));
+                                }
+                                Err(e) => {
+                                    tracing::error!(core, %addr, error = %e, "tcp from_std failed")
+                                }
+                            }
+                        }
                         Err(e) => tracing::error!(core, %addr, error = %e, "tcp bind failed"),
                     },
                     Proto::Udp => match reuseport_udp(addr) {
@@ -1292,6 +1302,63 @@ fn reuseport_tcp(addr: SocketAddr, l: &crate::config::Listener) -> io::Result<st
 /// Enable TCP Fast Open on a listening socket. Must be set before `listen()`.
 /// `qlen` bounds the pending-SYN queue (see `listeners[].fast_open_qlen`).
 /// socket2 0.5 has no wrapper for this option.
+/// Read back the TFO queue depth the kernel actually settled on.
+///
+/// Worth doing because this number is invisible from outside the process: it is
+/// not carried by inet_diag, so `ss` cannot show it at any verbosity. And the
+/// kernel silently clamps the requested value to `net.core.somaxconn`, so what
+/// we asked for is not necessarily what we got. `getsockopt(TCP_FASTOPEN)`
+/// reports the listener's `max_qlen`, which is the real thing.
+fn get_tcp_fastopen(fd: std::os::fd::RawFd) -> io::Result<u32> {
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: fd is a live socket owned by the caller; val/len are valid
+    // out-params of the size the option expects.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_FASTOPEN,
+            &mut val as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(val.max(0) as u32)
+}
+
+/// Report what a listener is really running with, once per address (core 0).
+/// `backlog` is echoed as configured — `ss -tln` shows the effective value in
+/// Send-Q — while the TFO queue is read back from the kernel, since nothing
+/// outside this process can.
+fn log_listener(addr: SocketAddr, l: &crate::config::Listener, fd: std::os::fd::RawFd) {
+    if !l.fast_open {
+        tracing::info!(%addr, backlog = l.backlog(), "tcp listener ready");
+        return;
+    }
+    match get_tcp_fastopen(fd) {
+        Ok(effective) => {
+            tracing::info!(
+                %addr,
+                backlog = l.backlog(),
+                fast_open_qlen = effective,
+                "tcp listener ready (fast_open active)"
+            );
+            if effective != l.fast_open_qlen() {
+                tracing::warn!(
+                    %addr,
+                    requested = l.fast_open_qlen(),
+                    effective,
+                    "fast_open_qlen was clamped by net.core.somaxconn"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(%addr, error = %e, "cannot read back fast_open_qlen"),
+    }
+}
+
 fn set_tcp_fastopen(sock: &Socket, qlen: u32) -> io::Result<()> {
     let qlen: libc::c_int = qlen as libc::c_int;
     // SAFETY: fd is owned by `sock` and outlives the call; qlen is a valid
