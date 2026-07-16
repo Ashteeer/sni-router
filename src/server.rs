@@ -732,7 +732,7 @@ pub fn fast_restart() -> ! {
             libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
         }
     }
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
+    let exe = exe_path();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let err = std::process::Command::new(exe).args(args).exec();
     tracing::error!(error = %err, "fast restart (re-exec) failed; exiting");
@@ -742,6 +742,35 @@ pub fn fast_restart() -> ! {
 #[cfg(not(unix))]
 pub fn fast_restart() -> ! {
     std::process::exit(1);
+}
+
+/// Path to exec on a fast restart.
+///
+/// `current_exe()` is `readlink /proc/self/exe`. After a self-update renamed a
+/// new binary over ours, the old inode is unlinked and that link resolves to
+/// `"<path> (deleted)"` — returned as `Ok`, so exec would fail with ENOENT and
+/// kill the process instead of restarting it. Strip the marker to reach the
+/// binary now holding the path. Only when the reported path is really gone, so
+/// a file genuinely named `... (deleted)` still execs itself.
+#[cfg(unix)]
+fn exe_path() -> PathBuf {
+    let p = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
+    // Only when the reported path is really gone, so a file genuinely named
+    // "... (deleted)" still execs itself.
+    if p.exists() {
+        return p;
+    }
+    strip_deleted(&p)
+}
+
+/// Drop procfs's `" (deleted)"` marker from an unlinked binary's path.
+#[cfg(unix)]
+fn strip_deleted(p: &std::path::Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    match p.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+        Some(real) => PathBuf::from(std::ffi::OsStr::from_bytes(real)),
+        None => p.to_path_buf(),
+    }
 }
 
 /// SIGUSR1 handler: validate the on-disk config, then fast-restart if it's good.
@@ -1135,4 +1164,24 @@ fn pin_to_core(core: usize) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = core;
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_deleted_recovers_the_replaced_binary_path() {
+        // What /proc/self/exe reports after a self-update renamed a new binary
+        // over the running one — exec'ing it verbatim would fail with ENOENT.
+        assert_eq!(
+            strip_deleted(std::path::Path::new("/usr/local/lib/sni-router/sni-router (deleted)")),
+            PathBuf::from("/usr/local/lib/sni-router/sni-router")
+        );
+        // Untouched binary: path passes through.
+        assert_eq!(
+            strip_deleted(std::path::Path::new("/usr/local/lib/sni-router/sni-router")),
+            PathBuf::from("/usr/local/lib/sni-router/sni-router")
+        );
+    }
 }
