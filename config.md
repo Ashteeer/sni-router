@@ -486,7 +486,7 @@ Reads (need the token when one is configured — the installer always sets one):
 | `GET /healthz`  | `ok`    | liveness |
 | `GET /status`   | JSON    | version, uptime, listeners, backends |
 | `GET /config`   | YAML    | the running config; `api.token` redacted |
-| `GET /metrics`  | text    | Prometheus exposition: global counters (connections, bytes, errors, rate‑limited, UDP flows) and per‑backend series |
+| `GET /metrics`  | text    | Prometheus exposition: global counters (connections, bytes, errors, rate‑limited, UDP flows, h2 pool hits) and per‑backend series |
 | `GET /version`  | JSON    | `{"version":"1.4.0"}` — the running binary's version |
 
 Writes (**require `api.token`** — without it they return `403`, so the config
