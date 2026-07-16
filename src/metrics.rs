@@ -21,6 +21,8 @@ pub struct Global {
     pub rate_limited: AtomicU64,
     pub udp_flows_total: AtomicU64,
     pub udp_datagrams: AtomicU64,
+    /// h2 gateway streams served from a pooled backend connection (no connect).
+    pub pool_hits: AtomicU64,
 }
 
 impl Global {
@@ -34,6 +36,7 @@ impl Global {
             rate_limited: AtomicU64::new(0),
             udp_flows_total: AtomicU64::new(0),
             udp_datagrams: AtomicU64::new(0),
+            pool_hits: AtomicU64::new(0),
         }
     }
 }
@@ -101,6 +104,7 @@ pub fn render() -> String {
     metric!("sni_router_rate_limited_total", "counter", "Connections dropped by max_conns_per_ip.", g.rate_limited.load(Ordering::Relaxed));
     metric!("sni_router_udp_flows_total", "counter", "UDP/QUIC flows routed.", g.udp_flows_total.load(Ordering::Relaxed));
     metric!("sni_router_udp_datagrams_total", "counter", "UDP datagrams received.", g.udp_datagrams.load(Ordering::Relaxed));
+    metric!("sni_router_h2_pool_hits_total", "counter", "h2 streams served from a pooled backend connection.", g.pool_hits.load(Ordering::Relaxed));
 
     // Per-backend series.
     let m = registry().lock().unwrap_or_else(|e| e.into_inner());

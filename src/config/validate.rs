@@ -332,6 +332,12 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                         "tls is ignored in redirect_https mode (it serves plaintext :80)",
                     ));
                 }
+                if b.fast_open {
+                    d.push(Diagnostic::warning(
+                        format!("{bp}.fast_open"),
+                        "fast_open is ignored in redirect_https mode (it never connects to a backend)",
+                    ));
+                }
                 // http_rules ARE honored here (plaintext responder); no warning.
             }
         }

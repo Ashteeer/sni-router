@@ -1,15 +1,4 @@
-mod acl;
-mod admin;
-mod backend;
-mod config;
-mod logging;
-mod metrics;
-mod protocol;
-mod redirect;
-mod router;
-mod server;
-mod terminate;
-mod update;
+use sni_router::{config, logging, server, update};
 
 use config::validate::{Diagnostic, Level};
 use std::io::IsTerminal;

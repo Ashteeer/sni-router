@@ -55,6 +55,9 @@ your config with `sni-router -t` first.
 | Zero-copy `splice()` TCP forwarding | done |
 | TCP Fast Open on listeners (`fast_open: true`) | done |
 | Tunable accept queues (`backlog`, `fast_open_qlen`) + TCP keepalive | done |
+| Pooled keep-alive backend connections for the HTTP/2 gateway | done |
+| TCP Fast Open to backends (`backends.*.fast_open`) | done |
+| Fuzzed protocol parsers (`cargo fuzz`, TLS + QUIC) | done |
 | WebSocket / HTTP Upgrade tunneling in terminate mode | done |
 | Hot reload on SIGHUP (validate first, keep old config on failure) | done |
 | Structured access logs + `tracing` (text/json) | done |
@@ -165,6 +168,30 @@ cd sni-router
 cargo build --release
 ./target/release/sni-router --help
 ```
+
+## Fuzzing
+
+The TLS and QUIC parsers read attacker-controlled bytes from anonymous clients,
+and the binary ships `panic = "abort"` — so a panic in a parser is a remote
+crash. They are fuzzed with [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
+(nightly only; the library target exists for this):
+
+```bash
+cargo install cargo-fuzz
+rustup toolchain install nightly
+
+cargo +nightly fuzz list                 # tls_sni, tls_fragmented, quic_initial
+cargo +nightly fuzz run tls_sni -- -max_total_time=60
+```
+
+| target | covers |
+|---|---|
+| `tls_sni` | ClientHello record framing + extension parsing |
+| `tls_fragmented` | the incremental path: a growing buffer fed chunk by chunk, as DPI-bypass clients produce |
+| `quic_initial` | Initial header protection, AEAD, CRYPTO frames, and the reassembler with attacker-chosen offsets |
+
+A crash writes the input to `fuzz/artifacts/<target>/`; replay it with
+`cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.
 
 ## License
 

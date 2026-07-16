@@ -1,0 +1,42 @@
+[package]
+name = "sni-router-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sni-router]
+path = ".."
+
+# Keep the fuzz crate out of the main package's build graph.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = true
+
+[[bin]]
+name = "tls_sni"
+path = "fuzz_targets/tls_sni.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_initial"
+path = "fuzz_targets/quic_initial.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_fragmented"
+path = "fuzz_targets/tls_fragmented.rs"
+test = false
+doc = false
+bench = false

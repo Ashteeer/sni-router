@@ -190,6 +190,7 @@ matrix](#38-field-applicability-by-mode)):
 | `proxy_protocol` | `none` \| `v1` \| `v2`                          | `none`         | send the real client IP to the upstream |
 | `balance`        | `round_robin` \| `least_conn`                   | `round_robin`  | server selection policy |
 | `health_check`   | bool                                            | `false`        | TCP‑connect probe; skip down servers |
+| `fast_open`      | bool                                            | `false`        | TCP Fast Open when connecting to `servers`; see [fast_open](#34-fast_open) |
 | `tls`            | object                                          | none           | cert/key the router presents (terminate modes) |
 | `backend_tls`    | object                                          | none           | re‑encrypt/mTLS to the upstream (terminate only) |
 | `headers`        | object                                          | all false      | inject `X-Forwarded-*` (terminate only) |
@@ -232,7 +233,29 @@ passthrough, where there are no HTTP headers). `none` | `v1` (text) | `v2`
 (binary). For UDP, the header is sent as its own leading datagram. Not relevant
 to `redirect_https`.
 
-### 3.4 `balance` and `health_check`
+### 3.4 `fast_open`
+
+`fast_open: true` connects to this backend's servers with TCP Fast Open
+(`TCP_FASTOPEN_CONNECT`): `connect` returns immediately and the first write
+rides along in the SYN, saving one round trip on repeat connects.
+
+Off by default, and worth turning on only when **both** hold:
+
+- the server is a **remote** hop — for `127.0.0.1` the RTT it saves is already
+  ~0, so it buys nothing;
+- the server has TFO **enabled itself** (`net.ipv4.tcp_fastopen` with the server
+  bit, plus its own listener opt-in). Otherwise the kernel just falls back to a
+  normal handshake.
+
+It is set best-effort: a kernel that refuses the option is not an error, TFO
+simply doesn't happen. Independent of `listeners[].fast_open`, which is about
+accepting client TFO. Ignored on the udp path (no TCP connect) and by
+`redirect_https` (no backend at all).
+
+Note this is a per-*connection* saving. For `http2: true` backends the pool
+(§3.9) usually matters more, since it removes the connect entirely.
+
+### 3.5 `balance` and `health_check`
 
 - `round_robin` (default) or `least_conn` (fewest active connections, counted
   with shared atomics across cores).
@@ -241,7 +264,7 @@ to `redirect_https`.
   always retry the next server in the pool. Health probing is meaningful for TCP
   backends only.
 
-### 3.5 `tls` (terminate / terminate_tcp)
+### 3.6 `tls` (terminate / terminate_tcp)
 
 The certificate the router presents to clients for names routed here. Optional
 per backend: if omitted, the top-level `default_tls` is used instead (at least
@@ -256,7 +279,7 @@ Files must exist and be readable at validation time. Certs are **hot‑reloaded*
 if the files change on disk (certbot/lego renewal), they are picked up with zero
 downtime — no restart or reload needed.
 
-### 3.6 `backend_tls` (terminate only — re‑encrypt / mTLS)
+### 3.7 `backend_tls` (terminate only — re‑encrypt / mTLS)
 
 When present, the router re‑encrypts to the upstream over TLS instead of
 plaintext.
@@ -272,7 +295,7 @@ plaintext.
 Constraint: **not combinable with `http2: true`** (the h2 gateway forwards to the
 backend over HTTP/1.1 plaintext) — this pairing is a validation error.
 
-### 3.7 `headers` (terminate only)
+### 3.8 `headers` (terminate only)
 
 Inject forwarding headers into the HTTP/1.1 (and h2‑gatewayed) request. Each is a
 bool, default `false`. Client‑supplied copies of these headers are dropped and
@@ -284,7 +307,32 @@ replaced so they cannot be spoofed.
 | `x_forwarded_for`   | `X-Forwarded-For`    | appends client IP to any existing chain |
 | `x_forwarded_proto` | `X-Forwarded-Proto`  | `https` |
 
-### 3.8 Field applicability by mode
+### 3.9 HTTP/2 backend connections
+
+With `http2: true` the router terminates h2 from the client and speaks HTTP/1.1
+to `servers`, mapping each multiplexed stream to one backend request.
+
+Backend connections are **pooled and reused**: after a response is fully read on
+a keep-alive connection, it is parked and the next stream takes it, so a burst of
+h2 streams no longer means a burst of connects. The pool is per core (monoio is
+thread-per-core and a socket belongs to its runtime), capped at 32 idle
+connections per server address, and entries older than 30s are discarded. Before
+reuse, the connection is checked with a non-blocking peek, so one the backend
+closed meanwhile is dropped rather than written to.
+
+A connection is only reused from a provably clean boundary: the response was
+fully consumed, it was not `Connection: close` (or HTTP/1.0 without keep-alive),
+and nothing is left buffered. `Content-Length: …` responses that end at EOF are
+never reused — the connection *is* the framing.
+
+Watch `sni_router_h2_pool_hits_total` in `/metrics`: streams served without a
+connect. Nothing to configure.
+
+Remaining limits: the backend is spoken to as **plaintext HTTP/1.1** (`http2`
+is not combinable with `backend_tls`), `least_conn` does not count h2 streams,
+and server push / trailers are not forwarded.
+
+### 3.10 Field applicability by mode
 
 `Y` = used, `—` = ignored (a WARNING is emitted if set), `req` = required.
 
@@ -294,6 +342,7 @@ replaced so they cannot be spoofed.
 | `proxy_protocol` | Y           | —         | Y             | —              |
 | `balance`        | Y           | Y         | Y             | —              |
 | `health_check`   | Y           | Y         | Y             | —              |
+| `fast_open`      | Y (tcp)     | Y         | Y             | —              |
 | `tls`            | —           | req       | req           | —              |
 | `backend_tls`    | —           | Y         | —             | —              |
 | `headers`        | —           | Y         | —             | —              |
@@ -531,6 +580,7 @@ Warnings (still exit `0`):
   inactive; the service starts anyway).
 - `backlog` / `fast_open_qlen` above `net.core.somaxconn` (the kernel clamps).
 - `fast_open_qlen` without `fast_open`, or `backlog` on `udp` (ignored).
+- `fast_open` on a `redirect_https` backend (it never connects to one).
 - Fields set but ignored for the chosen mode (see the applicability matrix).
 - A backend not referenced by any route.
 - Unusually large timeouts / buffer sizes.
@@ -683,6 +733,7 @@ Backend {
   proxy_protocol?: "none" | "v1" | "v2"
   balance?: "round_robin" | "least_conn"
   health_check?: bool
+  fast_open?: bool                            // default false; TFO to servers
   tls?: { cert: string, key: string }
   backend_tls?: { sni?, insecure_skip_verify?, ca?, client_cert?, client_key? }
   headers?: { x_real_ip?, x_forwarded_for?, x_forwarded_proto? }

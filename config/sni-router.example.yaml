@@ -54,6 +54,9 @@ backends:
     health_check: true          # per-backend TCP connect probe (default: false).
                                 # On failure a server is skipped; connects always
                                 # retry the next server in the pool regardless.
+    # fast_open: true           # TCP Fast Open when connecting to servers.
+                                # Only pays off for a REMOTE server that has TFO
+                                # enabled itself; pointless for 127.0.0.1.
     servers:
       - "10.0.0.1:443"
       - "10.0.0.2:443"

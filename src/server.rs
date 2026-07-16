@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -336,6 +337,116 @@ fn tune_stream(s: &TcpStream, keepalive: Option<Duration>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Idle backend connections for the HTTP/2 gateway
+// ---------------------------------------------------------------------------
+
+/// Idle keep-alive connections to backends, keyed by server address.
+///
+/// Thread-local by necessity and by design: monoio is thread-per-core and a
+/// `TcpStream` is bound to the runtime that created it (not `Send`), so each
+/// core keeps its own. No locking on the hot path as a result.
+///
+/// Only the h2 gateway uses this. HTTP/1.1 terminate holds one backend
+/// connection for the whole client connection, and passthrough hands the socket
+/// to splice — neither has a connection to hand back between requests.
+thread_local! {
+    static IDLE_BACKENDS: RefCell<HashMap<SocketAddr, Vec<(TcpStream, Instant)>>> =
+        RefCell::new(HashMap::new());
+    static IDLE_PUTS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Cap per server address, per core. Bounds file descriptors when a burst of
+/// concurrent streams opens more connections than steady state needs.
+const POOL_MAX_IDLE: usize = 32;
+/// How long an unused connection may sit before we stop trusting it. Backends
+/// close idle keep-alives on their own schedule (nginx defaults to 75s, Apache
+/// to 5s), so this is a cheap upper bound — `reusable` is what actually catches
+/// a closed one.
+const POOL_IDLE_TTL: Duration = Duration::from_secs(30);
+/// Sweep every N releases, so a backend removed from the config doesn't leave
+/// its idle connections parked forever.
+const POOL_SWEEP_EVERY: u32 = 256;
+
+/// Is this idle connection still usable?
+///
+/// A backend may close a keep-alive connection at any moment, and we would
+/// normally only discover that by writing into a socket that is already gone.
+/// A non-blocking peek asks now, without consuming anything: `0` means the peer
+/// closed, readable bytes on a connection we believe is idle mean the stream is
+/// out of sync (a late body, a pipelined response), and `EAGAIN` — nothing to
+/// read — is the one healthy answer.
+///
+/// This narrows the race to the microseconds between the peek and the write; it
+/// cannot close it. A backend that hangs up in that window fails the stream.
+/// ponytail: no retry-on-fresh-connection — that needs request-idempotence
+/// rules to be safe, and this window is orders of magnitude rarer than the
+/// closed-idle-connection case the peek already handles.
+fn reusable(s: &TcpStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut b = [0u8; 1];
+    // SAFETY: fd is owned by `s` and outlives the call; the buffer is a valid
+    // 1-byte destination. MSG_DONTWAIT keeps it from blocking the worker.
+    let n = unsafe {
+        libc::recv(s.as_raw_fd(), b.as_mut_ptr().cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
+    };
+    n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
+}
+
+/// Take a live idle connection to `addr`, if one is parked on this core.
+fn take_idle(addr: SocketAddr) -> Option<TcpStream> {
+    IDLE_BACKENDS.with(|p| {
+        let mut map = p.borrow_mut();
+        let v = map.get_mut(&addr)?;
+        // Newest first: it has had the least time to go stale.
+        while let Some((s, since)) = v.pop() {
+            if since.elapsed() < POOL_IDLE_TTL && reusable(&s) {
+                metrics::GLOBAL.pool_hits.fetch_add(1, Ordering::Relaxed);
+                return Some(s);
+            }
+        }
+        None
+    })
+}
+
+/// Park a connection for reuse. The caller must have left it on a clean message
+/// boundary (response fully read, no `Connection: close`, nothing buffered).
+fn put_idle(s: TcpStream) {
+    let Ok(addr) = s.peer_addr() else { return };
+    IDLE_BACKENDS.with(|p| {
+        let mut map = p.borrow_mut();
+        let n = IDLE_PUTS.with(|c| {
+            let n = c.get().wrapping_add(1);
+            c.set(n);
+            n
+        });
+        if n % POOL_SWEEP_EVERY == 0 {
+            for v in map.values_mut() {
+                v.retain(|(_, since)| since.elapsed() < POOL_IDLE_TTL);
+            }
+            map.retain(|_, v| !v.is_empty());
+        }
+        let v = map.entry(addr).or_default();
+        if v.len() < POOL_MAX_IDLE {
+            v.push((s, Instant::now()));
+        }
+    });
+}
+
+/// Open one backend connection, honouring `backends.*.fast_open`.
+///
+/// TFO here is `TCP_FASTOPEN_CONNECT`: `connect` returns immediately and the
+/// first write rides along in the SYN. monoio sets it best-effort, so a kernel
+/// that refuses simply falls back to a normal handshake.
+async fn connect_backend(addr: SocketAddr, fast_open: bool) -> io::Result<TcpStream> {
+    if fast_open {
+        let opts = monoio::net::TcpConnectOpts::new().tcp_fast_open(true);
+        TcpStream::connect_addr_with_config(addr, &opts).await
+    } else {
+        TcpStream::connect_addr(addr).await
+    }
+}
+
 /// `timeouts.keepalive` as a duration; `None` when disabled (0).
 fn keepalive_of(cfg: &Config) -> Option<Duration> {
     match cfg.timeouts.keepalive {
@@ -413,6 +524,10 @@ struct Dialer {
 }
 
 impl crate::terminate::BackendDial for Dialer {
+    fn release(&self, s: TcpStream) {
+        put_idle(s);
+    }
+
     async fn dial(&self) -> io::Result<TcpStream> {
         let st = self.shared.state.load_full();
         let pool = st
@@ -425,9 +540,14 @@ impl crate::terminate::BackendDial for Dialer {
                 io::Error::new(io::ErrorKind::Other, "no backend server available")
             })?;
             tried.push(cand);
-            match monoio::time::timeout(self.connect_timeout, TcpStream::connect(pool.addr(cand)))
-                .await
-            {
+            let addr = pool.addr(cand);
+            // A parked connection skips the handshake entirely — the whole point
+            // of the pool. It was tuned when it was first opened.
+            if let Some(s) = take_idle(addr) {
+                return Ok(s);
+            }
+            let dial = connect_backend(addr, pool.fast_open);
+            match monoio::time::timeout(self.connect_timeout, dial).await {
                 Ok(Ok(s)) => {
                     tune_stream(&s, self.keepalive);
                     return Ok(s);
@@ -574,7 +694,8 @@ async fn handle_tcp(
             }
         };
         tried.push(cand);
-        match monoio::time::timeout(connect_timeout, TcpStream::connect(pool.addr(cand))).await {
+        let dial = connect_backend(pool.addr(cand), pool.fast_open);
+        match monoio::time::timeout(connect_timeout, dial).await {
             Ok(Ok(s)) => {
                 tune_stream(&s, keepalive);
                 break (cand, s);
@@ -949,16 +1070,19 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
     let sock = Rc::new(sock);
     let mut flows: HashMap<SocketAddr, Flow> = HashMap::new();
     let mut ticks: u32 = 0;
+    // One buffer for the worker's lifetime, cycled through recv/send the same
+    // way the backend->client pump below does. io_uring needs owned buffers, so
+    // it is moved into each call and handed back — not allocated per datagram.
+    let mut buf = vec![0u8; UDP_DGRAM_MAX];
 
     loop {
-        let buf = vec![0u8; UDP_DGRAM_MAX];
-        let (res, buf) = sock.recv_from(buf).await;
+        let (res, b) = sock.recv_from(buf).await;
+        buf = b;
         let (n, peer) = match res {
             Ok(v) => v,
             Err(_) => continue,
         };
         metrics::GLOBAL.udp_datagrams.fetch_add(1, Ordering::Relaxed);
-        let dgram = &buf[..n];
 
         let st = shared.state.load_full();
         let idle = Duration::from_secs(st.cfg.timeouts.idle);
@@ -971,12 +1095,16 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
         if let Some(flow) = flows.get_mut(&peer) {
             flow.last = Instant::now();
             if flow.routed {
-                let _ = flow.upstream.send_to(dgram.to_vec(), flow.backend).await.0;
+                // The hot path for an established flow: forward the read buffer
+                // itself and take it back, no copy and no allocation.
+                let (_, slice) = flow.upstream.send_to(buf.slice(..n), flow.backend).await;
+                buf = slice.into_inner();
                 continue;
             }
-            // Still collecting the ClientHello for this flow.
-            flow.pending.push(dgram.to_vec());
-            if let Some(sni) = advance_quic(flow, dgram) {
+            // Still collecting the ClientHello: these copies are bounded by the
+            // handshake and are not the steady state.
+            flow.pending.push(buf[..n].to_vec());
+            if let Some(sni) = advance_quic(flow, &buf[..n]) {
                 route_udp(&mut flows, peer, sni, local, listener_idx, &shared, &sock).await;
             }
             continue;
@@ -996,10 +1124,10 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
             backend: local, // placeholder, set on routing
             routed: false,
             reasm: quic::CryptoReasm::new(),
-            pending: vec![dgram.to_vec()],
+            pending: vec![buf[..n].to_vec()],
             last: Instant::now(),
         };
-        let decided = advance_quic(&mut flow, dgram);
+        let decided = advance_quic(&mut flow, &buf[..n]);
         flows.insert(peer, flow);
         if let Some(sni) = decided {
             route_udp(&mut flows, peer, sni, local, listener_idx, &shared, &sock).await;

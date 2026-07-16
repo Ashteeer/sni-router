@@ -207,6 +207,14 @@ pub struct Backend {
     pub balance: Balance,
     #[serde(default)]
     pub health_check: bool,
+    /// Use TCP Fast Open when connecting to this backend's servers, saving one
+    /// RTT on repeat connects (`TCP_FASTOPEN_CONNECT`; the SYN carries the first
+    /// write). Off by default: it only pays off when the server is a remote hop
+    /// **and** has TFO enabled itself — for a local backend the RTT it saves is
+    /// already ~0. Ignored on the udp path (no TCP connect) and by
+    /// `redirect_https` (no backend at all).
+    #[serde(default)]
+    pub fast_open: bool,
     /// Cert/key the router presents to clients for `terminate`/`terminate_tcp`.
     /// Optional: if omitted, the top-level `default_tls` is used instead.
     pub tls: Option<Tls>,

@@ -350,6 +350,17 @@ impl<S: AsyncReadRent + AsyncWriteRent> Buf<S> {
         Buf { s, data: Vec::new() }
     }
 
+    /// Recover the stream. Only meaningful once `data` is empty — leftover bytes
+    /// mean the caller stopped mid-message and the stream can't be reused.
+    fn into_inner(self) -> S {
+        self.s
+    }
+
+    /// Nothing buffered: the last message ended exactly where the reads did.
+    fn is_drained(&self) -> bool {
+        self.data.is_empty()
+    }
+
     /// Read more bytes into the buffer. Returns false on EOF.
     async fn fill(&mut self) -> io::Result<bool> {
         let tmp = vec![0u8; IO_CHUNK];
@@ -879,10 +890,15 @@ where
 // HTTP/2 termination (h2 -> HTTP/1.1 gateway)
 // ---------------------------------------------------------------------------
 
-/// Supplies fresh backend TCP connections for the HTTP/2 gateway — one per
-/// multiplexed stream. Implemented by `server` (which owns pool/retry/health).
+/// Supplies backend TCP connections for the HTTP/2 gateway. Implemented by
+/// `server`, which owns the pool/retry/health logic and the idle-connection
+/// cache — `dial` may hand back a parked keep-alive connection instead of
+/// opening a new one.
 pub trait BackendDial: Clone + 'static {
     fn dial(&self) -> impl std::future::Future<Output = io::Result<TcpStream>>;
+    /// Offer a connection back for reuse. Only call this on a clean message
+    /// boundary: response fully consumed, keep-alive agreed, nothing buffered.
+    fn release(&self, s: TcpStream);
 }
 
 /// Drive an h2 connection: accept streams and gateway each to HTTP/1.1. Each
@@ -953,7 +969,8 @@ async fn h2_stream<D: BackendDial>(
         }
     }
 
-    // Forward to an HTTP/1.1 backend (fresh connection per stream).
+    // Forward to an HTTP/1.1 backend. `dial` may return a pooled keep-alive
+    // connection, so this is often handshake-free.
     let framing = req_body_framing(&request);
     let backend = dialer.dial().await?;
     let mut backend = Buf::new(backend);
@@ -966,6 +983,7 @@ async fn h2_stream<D: BackendDial>(
         Some(h) => h,
         None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "backend closed early")),
     };
+    let keep_alive = h1_keeps_alive(&rhead);
     let (resp, body) = h1_head_to_h2_response(&rhead)?;
     let end = matches!(body, Body::None);
     let mut send = respond.send_response(resp, end).map_err(h2_io)?;
@@ -973,9 +991,50 @@ async fn h2_stream<D: BackendDial>(
         Body::None => {}
         Body::Length(n) => h1_len_to_h2(&mut backend, &mut send, n).await?,
         Body::Chunked => h1_chunked_to_h2(&mut backend, &mut send).await?,
-        Body::UntilEof => h1_eof_to_h2(&mut backend, &mut send).await?,
+        // "Until EOF" *is* the framing: the response ends when the connection
+        // does, so there is nothing left to reuse.
+        Body::UntilEof => {
+            h1_eof_to_h2(&mut backend, &mut send).await?;
+            return Ok(());
+        }
+    }
+    // Reuse only from a provably clean boundary. `is_drained` is the guard that
+    // matters: leftover bytes would become the head of the next request's
+    // response — a response-splitting bug, not just a slow path.
+    if keep_alive && backend.is_drained() {
+        dialer.release(backend.into_inner());
     }
     Ok(())
+}
+
+/// May this HTTP/1.1 response's connection be reused for another request?
+///
+/// Defaults follow RFC 9112 §9.3: HTTP/1.1 persists, HTTP/1.0 does not, and an
+/// explicit `Connection:` token overrides the default either way. Anything we
+/// can't parse is treated as "don't reuse" — a wrong `false` costs a
+/// handshake, a wrong `true` corrupts the next response on that socket.
+fn h1_keeps_alive(head: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.split("\r\n");
+    let http11 = lines.next().is_some_and(|l| l.starts_with("HTTP/1.1"));
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if !name.trim().eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        let v = value.to_ascii_lowercase();
+        let mut tokens = v.split(',').map(str::trim);
+        if tokens.clone().any(|t| t == "close") {
+            return false;
+        }
+        if tokens.any(|t| t == "keep-alive") {
+            return true;
+        }
+    }
+    http11
 }
 
 /// Build an h2 `respond`/`redirect` response (`Response<()>` head + body bytes).
@@ -1352,6 +1411,32 @@ mod tests {
 
     fn rule(path: &str, action: HttpAction, status: Option<u16>) -> HttpRule {
         HttpRule { path: path.into(), action, status, body: String::new(), content_type: None, to: None }
+    }
+
+    /// Guards connection reuse in the h2 gateway: a wrong `true` here would
+    /// park a connection the backend is closing, and the next request on it
+    /// would read a truncated or foreign response.
+    #[test]
+    fn keep_alive_follows_version_and_connection_header() {
+        let cases: &[(&str, bool)] = &[
+            // HTTP/1.1 persists by default.
+            ("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", true),
+            // ...unless told otherwise.
+            ("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", false),
+            ("HTTP/1.1 200 OK\r\nconnection: CLOSE\r\n\r\n", false),
+            // Multi-token and padded values.
+            ("HTTP/1.1 200 OK\r\nConnection: keep-alive, foo\r\n\r\n", true),
+            ("HTTP/1.1 200 OK\r\nConnection: foo,  close \r\n\r\n", false),
+            // HTTP/1.0 closes by default...
+            ("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n", false),
+            // ...and opts in explicitly.
+            ("HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\n", true),
+            // Unparseable status line: refuse to reuse.
+            ("garbage\r\n\r\n", false),
+        ];
+        for (head, want) in cases {
+            assert_eq!(h1_keeps_alive(head.as_bytes()), *want, "head: {head:?}");
+        }
     }
 
     #[test]
