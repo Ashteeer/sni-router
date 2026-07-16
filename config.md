@@ -65,7 +65,9 @@ Each listener:
 | `name`  | string            | yes      | —       | unique across listeners; label only |
 | `bind`  | array of string   | yes      | —       | one or more `IP:port` accept addresses |
 | `proto` | `tcp` \| `udp`    | no       | `tcp`   | `udp` = QUIC passthrough |
+| `backlog` | int             | no       | `1024`  | `listen()` accept queue; `tcp` only; see [accept queues](#23-accept-queues-backlog--fast_open_qlen) |
 | `fast_open` | bool          | no       | `false` | accept TCP Fast Open; `tcp` only; see [fast_open](#22-fast_open) |
+| `fast_open_qlen` | int      | no       | `1024`  | pending-SYN queue for TFO; needs `fast_open: true` |
 | `acl`   | object            | no       | none    | see [ACL](#26-acl) |
 | `routes`| array of route    | yes      | —       | first match wins; see [routes](#25-routes) |
 
@@ -89,8 +91,11 @@ SNI and routes without waiting for the handshake to complete, saving one RTT.
 
 - **`proto: tcp` only.** `fast_open: true` on a `udp` listener is a config
   **error** (QUIC already does 0‑RTT itself).
-- **Listener‑side only.** There is no backend switch: the kernel decides on its
-  own whether outgoing connections use TFO.
+- **Listener‑side only.** Connections *to backends* never use TFO, and there is
+  no switch for it. That is not the kernel's choice: outgoing TFO requires the
+  application to opt in per connection (`MSG_FASTOPEN` / `TCP_FASTOPEN_CONNECT`),
+  and we don't — the win is one RTT to a backend that is usually a local or
+  same-datacenter hop, and it would only apply if that backend enabled TFO too.
 - **Requires the kernel's server bit:** `net.ipv4.tcp_fastopen` must be `3`.
   `-t` emits a **WARNING** (not an error) if it isn't — the service still
   starts, TFO is simply inactive and clients fall back to a normal handshake.
@@ -101,6 +106,34 @@ SNI and routes without waiting for the handshake to complete, saving one RTT.
   ```
 - Changing `fast_open` requires a restart (same as `bind`/`proto`) — a SIGHUP
   triggers a fast in-place restart, since the option is set before `listen()`.
+
+### 2.3 Accept queues: `backlog` / `fast_open_qlen`
+
+Two independent queues, both defaulting to **1024**, both `tcp` only. Omit them
+unless a counter says otherwise — the defaults are sized for a reconnect burst.
+
+| | `backlog` | `fast_open_qlen` |
+|---|---|---|
+| holds | connections whose handshake finished, waiting for `accept` | TFO connections whose data arrived, handshake not yet done |
+| set by | `listen(2)` | `TCP_FASTOPEN` |
+| on overflow | **SYNs are dropped** — the client retries or fails | client silently falls back to a normal handshake (no failure) |
+| watch | `ss -tln` (Send-Q on the LISTEN row), `nstat -az TcpExtListenOverflows` | `nstat -az TcpExtTCPFastOpenListenOverflow` |
+
+**Sizing.** A queue holds roughly `new_connections_per_sec × RTT` entries — it
+drains as fast as handshakes complete. At 1000 new conn/s and a 200 ms RTT that
+is ~200, so 1024 has room to spare. Memory is negligible: the TFO queue also
+holds each SYN's payload (≤ 1 MSS), so ~1.5 MB at full depth in the worst case.
+
+Raise `backlog` first if anything: it drops SYNs on overflow, while a full TFO
+queue only costs the client a round trip. Both are clamped by
+`net.core.somaxconn` — `-t` warns if you exceed it.
+
+- `0` is an **error** for either: `listen(0)` accepts nothing useful and TFO
+  qlen 0 turns TFO off. Omit the field for the default instead.
+- `fast_open_qlen` without `fast_open: true`, or `backlog` on a `udp` listener,
+  is a **warning** — the value is ignored.
+- Both are baked in before `listen()`, so changing either restarts in place
+  (same as `bind`/`proto`).
 
 ### 2.5 `routes`
 
@@ -335,10 +368,28 @@ http_rules:
 | `handshake`       | int  | `5`     | max time to read the full ClientHello (slowloris protection) |
 | `connect`         | int  | `10`    | backend connect timeout |
 | `idle`            | int  | `300`   | idle timeout (UDP flows; TLS data phase) |
+| `keepalive`       | int  | `60`    | TCP keepalive idle time; `0` = off; see below |
 | `health_interval` | int  | `10`    | how often health‑check probes run |
 | `drain`           | int  | `30`    | on SIGTERM, how long to wait for active connections before exit |
 
-All must be `> 0` (error otherwise). Values `> 86400` (24h) produce a WARNING.
+All must be `> 0` (error otherwise), except `keepalive`, where `0` means
+disabled. Values `> 86400` (24h) produce a WARNING.
+
+### 5.1 `keepalive`
+
+Set on **both** the client- and backend-facing socket of every TCP connection.
+This is what reaps connections whose peer vanished without a FIN/RST — a NAT
+rebind, a dead VPN client, a yanked cable. It matters more here than in a
+typical proxy: the passthrough data path is kernel `splice`, so the router never
+sees the bytes and cannot apply an idle timeout of its own. Without keepalive
+such a connection occupies its slot (and its per‑IP quota) indefinitely.
+
+The value is the idle time before the first probe. Probe interval and retry
+count are left to the system (`net.ipv4.tcp_keepalive_intvl` / `_probes`), so
+total detection time is `keepalive + intvl × probes`. The kernel's own default
+idle time is 7200s (2 hours), which is why we set 60 rather than inherit it.
+
+Verify on a live connection: `ss -tno` shows `timer:(keepalive,…)`.
 
 ---
 
@@ -427,7 +478,7 @@ version.
 **When a restart is needed vs. zero‑downtime hot‑swap** (same rule as SIGHUP): a
 change to routes, ACLs, timeouts, limits, or passthrough/redirect backends
 (including their server lists) is applied live. A change to a listener's
-`bind`/`proto`/`fast_open`, a `terminate`/`terminate_tcp` backend's TLS/headers/http2/
+`bind`/`proto`/`fast_open`/`backlog`/`fast_open_qlen`, a `terminate`/`terminate_tcp` backend's TLS/headers/http2/
 http_rules, `default_tls`, or the `api`/`log` sections requires a restart —
 `PUT`/`POST` perform it automatically and report `"applied":"restart"`.
 (`api.token` alone is hot‑swappable.)
@@ -469,14 +520,17 @@ Errors (exit non‑zero):
 10. `servers` non‑empty for every mode except `redirect_https`.
 11. `udp` listeners route only to `passthrough` backends, and don't set
     `fast_open`.
-12. Timeouts `> 0`; `max_client_hello ≥ 512`; valid `log.level`; valid
-    `api.bind`.
+12. `backlog` / `fast_open_qlen` are `> 0` when set.
+13. Timeouts `> 0` (except `keepalive`, where `0` = off); `max_client_hello ≥
+    512`; valid `log.level`; valid `api.bind`.
 
 Warnings (still exit `0`):
 
 - Unreachable (shadowed) routes.
 - `fast_open: true` while `net.ipv4.tcp_fastopen` is not `3` (TFO stays
   inactive; the service starts anyway).
+- `backlog` / `fast_open_qlen` above `net.core.somaxconn` (the kernel clamps).
+- `fast_open_qlen` without `fast_open`, or `backlog` on `udp` (ignored).
 - Fields set but ignored for the chosen mode (see the applicability matrix).
 - A backend not referenced by any route.
 - Unusually large timeouts / buffer sizes.
@@ -491,7 +545,7 @@ TCP connect to each server (opt‑in side effect).
 - **SIGHUP**: re‑reads and validates the file. On any error the old config keeps
   serving. Applies changes to routes/backends/timeouts/ACLs for **new**
   connections; live connections keep the config they started with (zero
-  downtime). If `bind`/`proto`/`fast_open` changed, it instead **fast-restarts** in place
+  downtime). If `bind`/`proto`/`fast_open`/`backlog`/`fast_open_qlen` changed, it instead **fast-restarts** in place
   (re-exec, same PID) to apply the new listeners — active connections drop.
 - **SIGUSR1**: fast restart on demand — validate the config, then re-exec in
   place, dropping all connections and rebinding immediately (no drain). Use this
@@ -607,7 +661,7 @@ Config {
   listeners?: Listener[]                      // may be empty (API-only config)
   backends?: { [name: string]: Backend }      // may be empty (API-only config)
   default_tls?: { cert: string, key: string } // shared cert for terminate backends
-  timeouts?: { handshake, connect, idle, health_interval, drain }   // ints, seconds
+  timeouts?: { handshake, connect, idle, keepalive, health_interval, drain } // ints, seconds
   limits?: { max_client_hello, max_conns_per_ip }                   // ints
   log?: { level: enum, format: enum }
   api?: { bind: string, token?: string, tls?: { cert: string, key: string } }
@@ -617,6 +671,9 @@ Listener {
   name: string
   bind: string[]                              // IP:port
   proto?: "tcp" | "udp"                       // default tcp
+  backlog?: int                               // default 1024; tcp only
+  fast_open?: boolean                         // default false; tcp only
+  fast_open_qlen?: int                        // default 1024; needs fast_open
   acl?: { allow_ip[], deny_ip[], allow_sni[], deny_sni[] }
   routes: { sni: string, backend: string }[]  // ordered, first match wins
 }

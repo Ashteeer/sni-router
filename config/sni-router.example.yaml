@@ -12,6 +12,10 @@ listeners:
     # fast_open: true           # accept TCP Fast Open (tcp only): returning
                                 # clients send the ClientHello in the SYN, saving
                                 # an RTT. Needs sysctl net.ipv4.tcp_fastopen=3.
+    # backlog: 1024             # listen() accept queue. Raise only if
+                                # "nstat -az TcpExtListenOverflows" is climbing.
+    # fast_open_qlen: 1024      # pending TFO SYNs; needs fast_open. Raise only if
+                                # TcpExtTCPFastOpenListenOverflow is climbing.
     # Optional access control (deny wins; an empty allow list means "any").
     # acl:
     #   allow_ip: ["10.0.0.0/8", "192.168.1.5"]
@@ -126,6 +130,9 @@ timeouts:
   handshake: 5                  # max time to read ClientHello (slowloris protection)
   connect: 10                   # backend connect timeout
   idle: 300                     # idle connection timeout
+  keepalive: 60                 # TCP keepalive idle time, both legs (0 = off).
+                                # Reaps peers that vanished without a FIN/RST —
+                                # the splice path has no idle timeout of its own.
   health_interval: 10           # how often to run health-check probes
   drain: 30                     # on SIGTERM, how long to wait for active conns
 

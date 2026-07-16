@@ -5,7 +5,7 @@
 //! by the SIGHUP reload path: an invalid new config is rejected and the old
 //! one keeps running.
 
-use super::{Config, HttpAction, Mode, Proto};
+use super::{Config, HttpAction, Mode, Proto, DEFAULT_QUEUE};
 use std::net::{IpAddr, SocketAddr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +107,37 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
             } else if let Some(msg) = tcp_fastopen_sysctl_issue() {
                 d.push(Diagnostic::warning(format!("listeners[{i}].fast_open"), msg));
             }
+        }
+        if l.fast_open_qlen.is_some() && !l.fast_open {
+            d.push(Diagnostic::warning(
+                format!("listeners[{i}].fast_open_qlen"),
+                "ignored — the queue only exists when fast_open is true",
+            ));
+        }
+        // Accept queues: a zero-length queue silently disables the thing it
+        // sizes (listen(0) accepts nothing useful; TFO qlen 0 turns TFO off),
+        // which is never what someone typing the field meant.
+        for (field, v, applies) in [
+            ("backlog", l.backlog, l.proto == Proto::Tcp),
+            ("fast_open_qlen", l.fast_open_qlen, l.fast_open),
+        ] {
+            let Some(v) = v else { continue };
+            if v == 0 {
+                d.push(Diagnostic::error(
+                    format!("listeners[{i}].{field}"),
+                    format!("must be > 0 (omit it for the default of {DEFAULT_QUEUE})"),
+                ));
+            } else if applies {
+                if let Some(msg) = somaxconn_issue(field, v) {
+                    d.push(Diagnostic::warning(format!("listeners[{i}].{field}"), msg));
+                }
+            }
+        }
+        if l.backlog.is_some() && l.proto != Proto::Tcp {
+            d.push(Diagnostic::warning(
+                format!("listeners[{i}].backlog"),
+                "ignored — udp has no listen() accept queue",
+            ));
         }
     }
 
@@ -418,6 +449,14 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
             d.push(Diagnostic::warning(p, format!("{v}s is unusually large (more than 24h)")));
         }
     }
+    // keepalive is the one timeout where 0 is meaningful (disabled), so it sits
+    // outside the loop above.
+    if cfg.timeouts.keepalive > 86_400 {
+        d.push(Diagnostic::warning(
+            "timeouts.keepalive",
+            format!("{}s is unusually large (more than 24h)", cfg.timeouts.keepalive),
+        ));
+    }
 
     // Management + metrics API bind address + optional TLS cert.
     if let Some(api) = &cfg.api {
@@ -484,6 +523,21 @@ fn tcp_fastopen_sysctl_issue() -> Option<String> {
             "fast_open is enabled but net.ipv4.tcp_fastopen = {v} — the kernel will not \
              accept TFO connections; run \"sysctl -w net.ipv4.tcp_fastopen=3\" \
              (persist in /etc/sysctl.d/). The service still starts, TFO is just inactive"
+        )
+    })
+}
+
+/// Warn when an accept queue exceeds `net.core.somaxconn`: the kernel silently
+/// clamps it, so the configured number would be a comfortable fiction.
+/// Unreadable sysctl (container, non-Linux) is not flagged — we can't tell.
+fn somaxconn_issue(field: &str, v: u32) -> Option<String> {
+    let raw = std::fs::read_to_string("/proc/sys/net/core/somaxconn").ok()?;
+    let max: u32 = raw.trim().parse().ok()?;
+    (v > max).then(|| {
+        format!(
+            "{field} = {v} exceeds net.core.somaxconn = {max} — the kernel will clamp the \
+             queue to {max}; raise the sysctl (\"sysctl -w net.core.somaxconn={v}\", \
+             persist in /etc/sysctl.d/) or lower {field}"
         )
     })
 }
@@ -641,6 +695,61 @@ backends:
     servers: ["10.0.0.1:443"]
 "#));
         assert!(errors(&d).is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn zero_length_accept_queues_are_errors() {
+        let d = validate(&cfg(r#"
+listeners:
+  - name: main
+    bind: ["0.0.0.0:443"]
+    proto: tcp
+    backlog: 0
+    fast_open: true
+    fast_open_qlen: 0
+    routes:
+      - { sni: "*", backend: web }
+backends:
+  web:
+    servers: ["10.0.0.1:443"]
+"#));
+        let paths: Vec<&str> = errors(&d).iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"listeners[0].backlog"), "{d:?}");
+        assert!(paths.contains(&"listeners[0].fast_open_qlen"), "{d:?}");
+    }
+
+    #[test]
+    fn queue_fields_warn_when_they_do_not_apply() {
+        let d = validate(&cfg(r#"
+listeners:
+  - name: q
+    bind: ["0.0.0.0:443"]
+    proto: udp
+    backlog: 2048
+    routes:
+      - { sni: "*", backend: web }
+  - name: t
+    bind: ["0.0.0.0:8443"]
+    proto: tcp
+    fast_open_qlen: 2048
+    routes:
+      - { sni: "*", backend: web }
+backends:
+  web:
+    servers: ["10.0.0.1:443"]
+"#));
+        assert!(errors(&d).is_empty(), "{d:?}");
+        let paths: Vec<&str> = warnings(&d).iter().map(|w| w.path.as_str()).collect();
+        assert!(paths.contains(&"listeners[0].backlog"), "udp backlog: {d:?}");
+        assert!(paths.contains(&"listeners[1].fast_open_qlen"), "qlen sans fast_open: {d:?}");
+    }
+
+    #[test]
+    fn omitted_queues_fall_back_to_the_default() {
+        let c = cfg(VALID);
+        assert_eq!(c.listeners[0].backlog(), DEFAULT_QUEUE);
+        assert_eq!(c.listeners[0].fast_open_qlen(), DEFAULT_QUEUE);
+        assert!(validate(&c).is_empty());
     }
 
     #[test]

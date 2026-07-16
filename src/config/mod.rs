@@ -120,17 +120,45 @@ pub struct Listener {
     pub bind: Vec<String>,
     #[serde(default)]
     pub proto: Proto,
+    /// `listen(2)` backlog: how many completed-handshake connections may wait
+    /// for `accept`. Absent = [`DEFAULT_QUEUE`]. Overflow drops SYNs, so raise
+    /// it for bursty reconnects. Capped by `net.core.somaxconn`. `tcp` only.
+    #[serde(default)]
+    pub backlog: Option<u32>,
     /// Accept TCP Fast Open connections (`TCP_FASTOPEN`), letting returning
     /// clients send the ClientHello inside the SYN. `proto: tcp` only; requires
     /// `net.ipv4.tcp_fastopen` to have the server bit set (sysctl 2 or 3).
     /// Outgoing connections to backends are unaffected.
     #[serde(default)]
     pub fast_open: bool,
+    /// Max pending TFO SYNs (connections whose data arrived but whose handshake
+    /// has not completed). Absent = [`DEFAULT_QUEUE`]. Overflow is not a
+    /// failure: the client silently falls back to a normal handshake.
+    #[serde(default)]
+    pub fast_open_qlen: Option<u32>,
     /// Optional access control for this listener (by client IP and/or SNI).
     #[serde(default)]
     pub acl: Option<AclConfig>,
     /// First match wins.
     pub routes: Vec<Route>,
+}
+
+/// Default depth for both accept queues (`listen()` backlog and TFO qlen).
+/// Sized for a reconnect burst: a queue holds roughly `new_conns_per_sec × RTT`
+/// entries, so 1024 covers ~1000 conn/s at a 200 ms RTT (~1.5 MB worst case for
+/// the TFO queue, which also holds the SYN payload).
+pub const DEFAULT_QUEUE: u32 = 1024;
+
+impl Listener {
+    /// `listen()` backlog for this listener.
+    pub fn backlog(&self) -> u32 {
+        self.backlog.unwrap_or(DEFAULT_QUEUE)
+    }
+
+    /// TFO pending-SYN queue depth for this listener.
+    pub fn fast_open_qlen(&self) -> u32 {
+        self.fast_open_qlen.unwrap_or(DEFAULT_QUEUE)
+    }
 }
 
 /// Raw access-control lists (strings); compiled into [`crate::acl::Acl`] at
@@ -325,6 +353,13 @@ pub struct Timeouts {
     pub connect: u64,
     /// Idle connection timeout.
     pub idle: u64,
+    /// TCP keepalive idle time in seconds (0 = off), set on both client- and
+    /// backend-facing sockets. The splice data path has no idle timeout — the
+    /// kernel moves the bytes and never reports back — so keepalive is what
+    /// reaps connections whose peer vanished without a FIN/RST (NAT rebind,
+    /// dead VPN client). Probe interval and retry count are left to the system
+    /// (`net.ipv4.tcp_keepalive_intvl`/`_probes`).
+    pub keepalive: u64,
     /// How often to run backend health-check probes (for backends with
     /// `health_check: true`).
     pub health_interval: u64,
@@ -335,7 +370,7 @@ pub struct Timeouts {
 
 impl Default for Timeouts {
     fn default() -> Self {
-        Self { handshake: 5, connect: 10, idle: 300, health_interval: 10, drain: 30 }
+        Self { handshake: 5, connect: 10, idle: 300, keepalive: 60, health_interval: 10, drain: 30 }
     }
 }
 

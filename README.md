@@ -54,6 +54,7 @@ your config with `sni-router -t` first.
 | Backend health checks (TCP probe) + connect retry across the pool | done |
 | Zero-copy `splice()` TCP forwarding | done |
 | TCP Fast Open on listeners (`fast_open: true`) | done |
+| Tunable accept queues (`backlog`, `fast_open_qlen`) + TCP keepalive | done |
 | WebSocket / HTTP Upgrade tunneling in terminate mode | done |
 | Hot reload on SIGHUP (validate first, keep old config on failure) | done |
 | Structured access logs + `tracing` (text/json) | done |
@@ -102,6 +103,7 @@ listeners:
     proto: tcp                    # tcp | udp (udp = QUIC)
     fast_open: true               # accept TCP Fast Open (needs sysctl
                                   # net.ipv4.tcp_fastopen=3)
+    # backlog: 1024               # listen() accept queue (default 1024)
     routes:                       # first match wins
       - sni: "example.com"
         backend: web_main

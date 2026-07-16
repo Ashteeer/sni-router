@@ -106,7 +106,16 @@ fn restart_sig(cfg: &Config) -> String {
     for l in &cfg.listeners {
         let mut binds = l.bind.clone();
         binds.sort();
-        let _ = write!(s, "L:{}:{:?}:{:?}:{};", l.name, l.proto, binds, l.fast_open);
+        let _ = write!(
+            s,
+            "L:{}:{:?}:{:?}:{}:{}:{};",
+            l.name,
+            l.proto,
+            binds,
+            l.fast_open,
+            l.fast_open_qlen(),
+            l.backlog()
+        );
     }
     // For terminate backends only the parts baked into the immutable
     // TerminateCtx matter (cert, re-encrypt, headers, http2, http_rules, mode) —
@@ -245,7 +254,7 @@ fn worker(core: usize, shared: Arc<Shared>) {
                     Err(_) => continue, // validated already
                 };
                 match l.proto {
-                    Proto::Tcp => match reuseport_tcp(addr, l.fast_open) {
+                    Proto::Tcp => match reuseport_tcp(addr, l) {
                         Ok(std_l) => match TcpListener::from_std(std_l) {
                             Ok(listener) => {
                                 let sh = shared.clone();
@@ -301,6 +310,37 @@ async fn tcp_accept_loop(
                 monoio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+    }
+}
+
+/// Socket options for every TCP stream on the data path — client-facing and
+/// backend-facing alike, so a forwarded byte meets the same settings on both
+/// legs.
+///
+/// `TCP_NODELAY` is unconditional: a router must never sit on a small write
+/// waiting for more data to batch. Nagle holds a sub-MSS segment until the
+/// previous one is ACKed, which against the peer's delayed ACK stalls a
+/// forwarded packet for tens of milliseconds — the exact profile of what we
+/// carry (VPN, DoT, WebSocket, request/response). There is no workload here
+/// where batching beats latency: we forward someone else's already-framed
+/// bytes, so the sender's own batching decisions are the ones that count.
+///
+/// Failures are ignored: a socket that rejects an option still works, just
+/// without the tuning, and dropping a live connection over it would be worse.
+fn tune_stream(s: &TcpStream, keepalive: Option<Duration>) {
+    let _ = s.set_nodelay(true);
+    if let Some(idle) = keepalive {
+        // Interval/retries stay at the system defaults — one knob to reason
+        // about, and the system's values are already tuned per host.
+        let _ = s.set_tcp_keepalive(Some(idle), None, None);
+    }
+}
+
+/// `timeouts.keepalive` as a duration; `None` when disabled (0).
+fn keepalive_of(cfg: &Config) -> Option<Duration> {
+    match cfg.timeouts.keepalive {
+        0 => None,
+        s => Some(Duration::from_secs(s)),
     }
 }
 
@@ -369,6 +409,7 @@ struct Dialer {
     shared: Arc<Shared>,
     backend: String,
     connect_timeout: Duration,
+    keepalive: Option<Duration>,
 }
 
 impl crate::terminate::BackendDial for Dialer {
@@ -387,7 +428,10 @@ impl crate::terminate::BackendDial for Dialer {
             match monoio::time::timeout(self.connect_timeout, TcpStream::connect(pool.addr(cand)))
                 .await
             {
-                Ok(Ok(s)) => return Ok(s),
+                Ok(Ok(s)) => {
+                    tune_stream(&s, self.keepalive);
+                    return Ok(s);
+                }
                 _ => {
                     if pool.health_check() {
                         pool.set_healthy(cand, false);
@@ -409,6 +453,8 @@ async fn handle_tcp(
     // (possibly long-lived) connection, and Guards are meant to be short.
     let st = shared.state.load_full();
     let acl = st.acls.get(listener_idx).and_then(|a| a.as_ref());
+    let keepalive = keepalive_of(&st.cfg);
+    tune_stream(&client, keepalive);
 
     // IP ACL: reject before we spend any effort reading the handshake.
     if let Some(acl) = acl {
@@ -529,7 +575,10 @@ async fn handle_tcp(
         };
         tried.push(cand);
         match monoio::time::timeout(connect_timeout, TcpStream::connect(pool.addr(cand))).await {
-            Ok(Ok(s)) => break (cand, s),
+            Ok(Ok(s)) => {
+                tune_stream(&s, keepalive);
+                break (cand, s);
+            }
             _ => {
                 if pool.health_check() {
                     pool.set_healthy(cand, false);
@@ -547,6 +596,7 @@ async fn handle_tcp(
             shared: shared.clone(),
             backend: backend_name.to_string(),
             connect_timeout,
+            keepalive,
         };
         let res = match shared.terminate.get(backend_name) {
             Some(ctx) => {
@@ -1102,20 +1152,20 @@ fn dummy_udp() -> UdpSocket {
 // Socket setup
 // ---------------------------------------------------------------------------
 
-fn reuseport_tcp(addr: SocketAddr, fast_open: bool) -> io::Result<std::net::TcpListener> {
+fn reuseport_tcp(addr: SocketAddr, l: &crate::config::Listener) -> io::Result<std::net::TcpListener> {
     let sock = new_reuseport_socket(addr, Type::STREAM, SockProto::TCP)?;
-    if fast_open {
-        set_tcp_fastopen(&sock)?;
+    if l.fast_open {
+        set_tcp_fastopen(&sock, l.fast_open_qlen())?;
     }
-    sock.listen(1024)?;
+    sock.listen(l.backlog() as i32)?;
     Ok(sock.into())
 }
 
 /// Enable TCP Fast Open on a listening socket. Must be set before `listen()`.
-/// The value is the SYN-queue length for connections still to be validated;
-/// it mirrors the listen backlog. socket2 0.5 has no wrapper for this option.
-fn set_tcp_fastopen(sock: &Socket) -> io::Result<()> {
-    let qlen: libc::c_int = 1024;
+/// `qlen` bounds the pending-SYN queue (see `listeners[].fast_open_qlen`).
+/// socket2 0.5 has no wrapper for this option.
+fn set_tcp_fastopen(sock: &Socket, qlen: u32) -> io::Result<()> {
+    let qlen: libc::c_int = qlen as libc::c_int;
     // SAFETY: fd is owned by `sock` and outlives the call; qlen is a valid
     // c_int of the size we pass.
     let rc = unsafe {
@@ -1169,6 +1219,24 @@ fn pin_to_core(core: usize) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Also pins the reason the call exists: the kernel default really is Nagle
+    /// on, so without `tune_stream` every forwarded byte pays for it.
+    #[test]
+    fn tune_stream_disables_nagle() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = l.local_addr().expect("local_addr");
+            // connect completes on the kernel handshake; no accept needed.
+            let c = TcpStream::connect(addr).await.expect("connect");
+            assert!(!c.nodelay().expect("getsockopt"), "kernel default should be Nagle on");
+            tune_stream(&c, Some(Duration::from_secs(30)));
+            assert!(c.nodelay().expect("getsockopt"), "tune_stream must set TCP_NODELAY");
+        });
+    }
 
     #[test]
     fn strip_deleted_recovers_the_replaced_binary_path() {
