@@ -122,7 +122,8 @@ where
         ("GET", "/config") => {
             // The api token is `skip_serializing`, so it never appears here.
             let body = serde_norway::to_string(&state.cfg).unwrap_or_default();
-            respond(&mut s, 200, "OK", "application/yaml", body.as_bytes()).await
+            let etag = etag_of(&state.cfg);
+            respond_etag(&mut s, 200, "OK", "application/yaml", body.as_bytes(), Some(&etag)).await
         }
         ("GET", "/metrics") => {
             let body = crate::metrics::render();
@@ -220,6 +221,19 @@ where
     if cur_token_set && cfg.api.as_ref().is_some_and(|a| a.token.is_none()) {
         return respond(s, 400, "Bad Request", "application/json",
             b"{\"error\":\"api.token is missing (GET /config redacts it) - include the token in the body, or remove it by editing the file on disk\"}\n").await;
+    }
+
+    // Optimistic concurrency: if the client sent the ETag it read (`If-Match`),
+    // reject the write when the config changed underneath it — so two web-UI
+    // sessions can't silently clobber each other's edits. `*` matches anything
+    // (unconditional write), and no header at all keeps the old behavior.
+    if let Some(want) = header_value(head, "if-match") {
+        let want = want.trim();
+        let current = etag_of(&shared.state.load().cfg);
+        if want != "*" && want != current {
+            return respond(s, 409, "Conflict", "application/json",
+                b"{\"error\":\"config changed since it was read (If-Match mismatch); re-fetch GET /config and retry\"}\n").await;
+        }
     }
 
     // Write atomically (temp + rename) so a crash mid-write can't corrupt it.
@@ -501,9 +515,29 @@ async fn respond<S>(
 where
     S: AsyncReadRent + AsyncWriteRent,
 {
+    respond_etag(s, code, reason, content_type, body, None).await
+}
+
+/// Like [`respond`] but optionally emits an `ETag` (used by `GET /config` so a
+/// web UI can do optimistic concurrency with `If-Match` on `PUT /config`).
+async fn respond_etag<S>(
+    s: &mut S,
+    code: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+    etag: Option<&str>,
+) -> io::Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent,
+{
+    let etag_line = match etag {
+        Some(e) => format!("ETag: {e}\r\n"),
+        None => String::new(),
+    };
     let head = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n",
+         Content-Length: {}\r\n{etag_line}Connection: close\r\n\r\n",
         body.len()
     );
     let mut out = head.into_bytes();
@@ -512,4 +546,15 @@ where
     r?;
     let _ = s.shutdown().await;
     Ok(())
+}
+
+/// Weak validator over the (token-redacted) serialized config, used as an
+/// `ETag`. A cheap content hash — enough for optimistic concurrency, not a
+/// security primitive.
+fn etag_of(cfg: &crate::config::Config) -> String {
+    use std::hash::{Hash, Hasher};
+    let yaml = serde_norway::to_string(cfg).unwrap_or_default();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    yaml.hash(&mut h);
+    format!("\"{:016x}\"", h.finish())
 }

@@ -11,21 +11,33 @@ use crate::config::{HttpAction, HttpRule};
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 use std::io;
+use std::time::Duration;
 
 const HEAD_MAX: usize = 16 * 1024;
 
 /// Read the request head (continuing from `prefix`), pick a response per
 /// `rules`, write it, and close. Returns the number of response bytes written.
-pub async fn handle(prefix: &[u8], client: &mut TcpStream, rules: &[HttpRule]) -> io::Result<u64> {
+/// `idle` bounds each read so a client that dribbles the request head can't pin
+/// this connection (slowloris on a plaintext `:80`).
+pub async fn handle(
+    prefix: &[u8],
+    client: &mut TcpStream,
+    rules: &[HttpRule],
+    idle: Duration,
+) -> io::Result<u64> {
     let mut buf = prefix.to_vec();
+    let mut scratch = vec![0u8; 2048];
     while find(&buf, b"\r\n\r\n").is_none() && buf.len() < HEAD_MAX {
-        let tmp = vec![0u8; 2048];
-        let (r, tmp) = client.read(tmp).await;
+        let (r, b) = match monoio::time::timeout(idle, client.read(scratch)).await {
+            Ok(v) => v,
+            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "idle read timeout")),
+        };
+        scratch = b;
         let n = r?;
         if n == 0 {
             break;
         }
-        buf.extend_from_slice(&tmp[..n]);
+        buf.extend_from_slice(&scratch[..n]);
     }
 
     let resp = build_response(rules, &buf);

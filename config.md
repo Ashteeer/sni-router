@@ -445,7 +445,7 @@ http_rules:
 |-------------------|------|---------|-------|
 | `handshake`       | int  | `5`     | max time to read the full ClientHello (slowloris protection) |
 | `connect`         | int  | `10`    | backend connect timeout |
-| `idle`            | int  | `300`   | idle timeout (UDP flows; TLS data phase) |
+| `idle`            | int  | `300`   | idle read timeout: UDP flows, and every user-space read in `terminate` / `terminate_tcp` / `redirect_https` (TLS handshake + HTTP request/response). Passthrough (`splice`) and established raw/WebSocket tunnels are reaped by `keepalive` instead |
 | `keepalive`       | int  | `60`    | TCP keepalive idle time; `0` = off; see below |
 | `health_interval` | int  | `10`    | how often health‑check probes run |
 | `drain`           | int  | `30`    | on SIGTERM, how long to wait for active connections before exit |
@@ -514,7 +514,7 @@ Reads (need the token when one is configured — the installer always sets one):
 |-----------------|---------|-------|
 | `GET /healthz`  | `ok`    | liveness |
 | `GET /status`   | JSON    | version, uptime, listeners, backends |
-| `GET /config`   | YAML    | the running config; `api.token` redacted |
+| `GET /config`   | YAML    | the running config; `api.token` redacted. Sends an `ETag` header (a hash of the config) for optimistic concurrency — pass it back as `If-Match` on `PUT /config` |
 | `GET /metrics`  | text    | Prometheus exposition: global counters (connections, bytes, errors, rate‑limited, UDP flows, h2 pool hits) and per‑backend series |
 | `GET /version`  | JSON    | `{"version":"1.4.0"}` — the running binary's version |
 
@@ -523,7 +523,7 @@ can't be changed unauthenticated):
 
 | method + path   | body        | effect |
 |-----------------|-------------|--------|
-| `PUT /config`   | YAML config | validate → atomically replace the config file → apply. Invalid config → `400` with a JSON error list, **nothing is written**. The body **must include `api.token`** while one is configured (`GET /config` redacts it, so a blind GET→PUT round‑trip is rejected with `400` instead of silently disabling auth). |
+| `PUT /config`   | YAML config | validate → atomically replace the config file → apply. Invalid config → `400` with a JSON error list, **nothing is written**. The body **must include `api.token`** while one is configured (`GET /config` redacts it, so a blind GET→PUT round‑trip is rejected with `400` instead of silently disabling auth). Optional `If-Match: <etag>` (the value from `GET /config`) makes the write conditional: if the config changed since it was read, it's rejected with `409 Conflict` instead of clobbering the other edit — so two web‑UI sessions can't lost‑update each other. `If-Match: *` (or no header) writes unconditionally. |
 | `POST /reload`  | —           | re‑read the config file from disk and apply it (like SIGHUP). |
 | `POST /restart` | —           | validate the on‑disk config, then re‑exec the process (drops connections, rebinds immediately). Privilege‑free equivalent of `systemctl restart`. |
 | `POST /update`  | —           | check GitHub for a newer release; if one exists, download it, replace the binary, and re‑exec into it. See below. |
@@ -539,7 +539,10 @@ poll `GET /version` to confirm the new version is live):
 
 The update only ever fetches this project's **official** GitHub release assets
 (the repo is compiled in, never taken from the request), so it can only install an
-official build. It needs write access to the directory the binary lives in — the
+official build. The download is verified against the release's `SHA256SUMS`
+manifest before it replaces the running binary — a mismatch (or a release without
+the manifest) aborts the update, so a swapped asset or a transport MITM can't
+install a tampered binary. It needs write access to the directory the binary lives in — the
 installer puts the binary under `/usr/local/lib/sni-router/` owned by the service
 user for exactly this reason (with a `/usr/local/bin/sni-router` symlink on PATH).
 The same logic backs the CLI: `sni-router -u` (`--update`, add `--force` to

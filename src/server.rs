@@ -41,7 +41,11 @@ use crate::metrics;
 
 const UDP_DGRAM_MAX: usize = 2048;
 const MAX_UDP_FLOWS: usize = 100_000;
-const UDP_SWEEP_EVERY: u32 = 512;
+/// How often to reap idle UDP flows. Time-based, not packet-counted: a flood of
+/// datagrams must not force a full-table scan on every Nth packet, and a quiet
+/// table must still be swept. This is only the backstop for flows that never got
+/// a backend reply — the backend->client pump already reaps on its own idle.
+const UDP_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// State that can be swapped atomically on SIGHUP reload.
 pub struct State {
@@ -62,8 +66,21 @@ pub struct Shared {
     /// Set on SIGTERM: accept loops stop taking new work and the process drains.
     shutting_down: AtomicBool,
     /// Active connection count per client IP, for `limits.max_conns_per_ip`.
-    /// Contended only on connect/disconnect, never on the data path.
-    conns_per_ip: Mutex<HashMap<IpAddr, u32>>,
+    /// Contended only on connect/disconnect, never on the data path — and
+    /// sharded by IP so accepts from different clients don't serialize on one
+    /// lock across all cores. Only touched when the limit is enabled.
+    conns_per_ip: [Mutex<HashMap<IpAddr, u32>>; IP_SHARDS],
+}
+
+/// Number of `conns_per_ip` shards. A power of two so the hash maps cheaply.
+const IP_SHARDS: usize = 32;
+
+/// Which `conns_per_ip` shard an address belongs to.
+fn ip_shard(ip: IpAddr) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ip.hash(&mut h);
+    (h.finish() as usize) & (IP_SHARDS - 1)
 }
 
 /// Outcome of applying a new config through the admin API.
@@ -145,7 +162,7 @@ fn restart_sig(cfg: &Config) -> String {
 fn build_state(cfg: Config) -> State {
     let mut pools = HashMap::new();
     for (name, b) in &cfg.backends {
-        if let Some(p) = Pool::from_backend(b) {
+        if let Some(p) = Pool::from_backend(name, b) {
             pools.insert(name.clone(), p);
         }
     }
@@ -169,7 +186,7 @@ pub fn run(cfg: Config, config_path: PathBuf) -> io::Result<()> {
         started: Instant::now(),
         config_path,
         shutting_down: AtomicBool::new(false),
-        conns_per_ip: Mutex::new(HashMap::new()),
+        conns_per_ip: std::array::from_fn(|_| Mutex::new(HashMap::new())),
     });
 
     spawn_signal_thread(shared.clone());
@@ -254,8 +271,9 @@ fn worker(core: usize, shared: Arc<Shared>) {
                     Ok(a) => a,
                     Err(_) => continue, // validated already
                 };
+                let defer_accept = snapshot.cfg.timeouts.handshake as u32;
                 match l.proto {
-                    Proto::Tcp => match reuseport_tcp(addr, l) {
+                    Proto::Tcp => match reuseport_tcp(addr, l, defer_accept) {
                         Ok(std_l) => {
                             // One report per address, not per reuseport worker.
                             if core == 0 {
@@ -351,15 +369,15 @@ fn tune_stream(s: &TcpStream, keepalive: Option<Duration>) {
 // Idle backend connections for the HTTP/2 gateway
 // ---------------------------------------------------------------------------
 
-/// Idle keep-alive connections to backends, keyed by server address.
-///
-/// Thread-local by necessity and by design: monoio is thread-per-core and a
-/// `TcpStream` is bound to the runtime that created it (not `Send`), so each
-/// core keeps its own. No locking on the hot path as a result.
-///
-/// Only the h2 gateway uses this. HTTP/1.1 terminate holds one backend
-/// connection for the whole client connection, and passthrough hands the socket
-/// to splice — neither has a connection to hand back between requests.
+// Idle keep-alive connections to backends, keyed by server address.
+//
+// Thread-local by necessity and by design: monoio is thread-per-core and a
+// `TcpStream` is bound to the runtime that created it (not `Send`), so each
+// core keeps its own. No locking on the hot path as a result.
+//
+// Only the h2 gateway uses this. HTTP/1.1 terminate holds one backend
+// connection for the whole client connection, and passthrough hands the socket
+// to splice — neither has a connection to hand back between requests.
 thread_local! {
     static IDLE_BACKENDS: RefCell<HashMap<SocketAddr, Vec<(TcpStream, Instant)>>> =
         RefCell::new(HashMap::new());
@@ -475,7 +493,12 @@ struct IpLimit<'a> {
 impl<'a> IpLimit<'a> {
     /// Try to admit one more connection from `ip`. `None` = at the limit.
     /// Only called when `limit > 0` (the caller handles the unlimited case).
-    fn acquire(map: &'a Mutex<HashMap<IpAddr, u32>>, ip: IpAddr, limit: usize) -> Option<Self> {
+    fn acquire(
+        shards: &'a [Mutex<HashMap<IpAddr, u32>>; IP_SHARDS],
+        ip: IpAddr,
+        limit: usize,
+    ) -> Option<Self> {
+        let map = &shards[ip_shard(ip)];
         let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
         let n = m.entry(ip).or_insert(0);
         if (*n as usize) >= limit {
@@ -584,6 +607,13 @@ async fn handle_tcp(
     let st = shared.state.load_full();
     let acl = st.acls.get(listener_idx).and_then(|a| a.as_ref());
     let keepalive = keepalive_of(&st.cfg);
+    // Idle read deadline for the post-handshake phases (terminate / terminate_tcp
+    // / redirect). Unlike passthrough — which splice reaps via TCP keepalive —
+    // these paths parse in user space and would otherwise let a client that
+    // finished the TLS handshake then dribbles bytes pin an fd, a task, and a
+    // backend connection indefinitely (slowloris). Every user-space read is
+    // bounded by this.
+    let idle = Duration::from_secs(st.cfg.timeouts.idle);
     tune_stream(&client, keepalive);
 
     // IP ACL: reject before we spend any effort reading the handshake.
@@ -614,18 +644,22 @@ async fn handle_tcp(
     let hs_timeout = Duration::from_secs(st.cfg.timeouts.handshake);
 
     // Buffer the ClientHello (across as many reads as it takes) and pull the SNI.
+    // `scratch` is read into and reused across iterations, the same owned-buffer
+    // cycle splice/tunnel use — no per-read allocation even when a DPI-bypass
+    // client dribbles the hello a few bytes at a time and spins this loop.
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut scratch = vec![0u8; 4096];
     let sni = loop {
-        let tmp = vec![0u8; 4096];
-        let (res, tmp) = match monoio::time::timeout(hs_timeout, client.read(tmp)).await {
+        let (res, b) = match monoio::time::timeout(hs_timeout, client.read(scratch)).await {
             Ok(v) => v,
             Err(_) => return Ok(()), // handshake timeout (slowloris) — drop
         };
+        scratch = b;
         let n = res?;
         if n == 0 {
             return Ok(()); // client closed before we could route
         }
-        buf.extend_from_slice(&tmp[..n]);
+        buf.extend_from_slice(&scratch[..n]);
         match tls::extract_sni(&buf, max) {
             tls::Sni::Found(s) => break s,
             tls::Sni::Absent | tls::Sni::NotClientHello => break String::new(),
@@ -657,7 +691,7 @@ async fn handle_tcp(
 
     // redirect_https answers directly (301 / rules), no upstream connect.
     if pool.mode == Mode::RedirectHttps {
-        let bm = metrics::backend(backend_name);
+        let bm = pool.metrics.clone();
         metrics::GLOBAL.conns_total.fetch_add(1, Ordering::Relaxed);
         bm.conns_total.fetch_add(1, Ordering::Relaxed);
         let rules = st
@@ -666,7 +700,7 @@ async fn handle_tcp(
             .get(backend_name)
             .map(|b| b.http_rules.as_slice())
             .unwrap_or(&[]);
-        let res = crate::redirect::handle(&buf, &mut client, rules).await;
+        let res = crate::redirect::handle(&buf, &mut client, rules, idle).await;
         let down = *res.as_ref().unwrap_or(&0);
         metrics::GLOBAL.bytes_down.fetch_add(down, Ordering::Relaxed);
         bm.bytes_down.fetch_add(down, Ordering::Relaxed);
@@ -685,53 +719,79 @@ async fn handle_tcp(
         return res.map(|_| ());
     }
 
-    let bm = metrics::backend(backend_name);
-
-    // Connect with retry across the pool: on failure try the next server
-    // (healthy ones first). A live connect failure also marks the server down
-    // when health checks are on, so the checker owns bringing it back.
+    let bm = pool.metrics.clone();
     let connect_timeout = Duration::from_secs(st.cfg.timeouts.connect);
-    let mut tried: Vec<usize> = Vec::new();
-    let (idx, backend_tcp) = loop {
-        let cand = match pool.pick_candidate(&tried) {
-            Some(i) => i,
-            None => {
-                // Every server failed to connect — drop.
-                metrics::GLOBAL.conn_errors.fetch_add(1, Ordering::Relaxed);
-                bm.errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(backend = backend_name, sni = sni_log(&sni), "all backend servers unreachable");
-                return Ok(());
-            }
-        };
-        tried.push(cand);
-        let dial = connect_backend(pool.addr(cand), pool.fast_open);
-        match monoio::time::timeout(connect_timeout, dial).await {
-            Ok(Ok(s)) => {
-                tune_stream(&s, keepalive);
-                break (cand, s);
-            }
-            _ => {
-                if pool.health_check() {
-                    pool.set_healthy(cand, false);
+
+    // The terminate TLS context (if any), fetched up front because whether we
+    // pre-connect depends on it: an http2-enabled terminate backend never uses
+    // an eagerly-opened backend connection (an h2 client dials per stream via
+    // the pool; an h1 client dials lazily inside the handler), so a pre-connect
+    // would just churn a connect+close on the backend for every client that
+    // turns out to speak h2 — skip it.
+    let term_ctx = match pool.mode {
+        Mode::Terminate | Mode::TerminateTcp => shared.terminate.get(backend_name),
+        _ => None,
+    };
+    let defer_connect = pool.mode == Mode::Terminate && term_ctx.is_some_and(|c| c.http2);
+
+    // Connect with retry across the pool unless this backend defers its connect.
+    // On failure try the next server (healthy first); a live failure also marks
+    // the server down when health checks are on, so the checker owns recovery.
+    // `conn_guard` holds the least-conn counter for the chosen server; it stays
+    // `None` on the deferred path (h2 least-conn is per-stream, tracked there).
+    let mut conn_guard: Option<ConnGuard> = None;
+    let backend_tcp: Option<TcpStream> = if defer_connect {
+        None
+    } else {
+        let mut tried: Vec<usize> = Vec::new();
+        loop {
+            let cand = match pool.pick_candidate(&tried) {
+                Some(i) => i,
+                None => {
+                    // Every server failed to connect — drop.
+                    metrics::GLOBAL.conn_errors.fetch_add(1, Ordering::Relaxed);
+                    bm.errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(backend = backend_name, sni = sni_log(&sni), "all backend servers unreachable");
+                    return Ok(());
+                }
+            };
+            tried.push(cand);
+            let dial = connect_backend(pool.addr(cand), pool.fast_open);
+            match monoio::time::timeout(connect_timeout, dial).await {
+                Ok(Ok(s)) => {
+                    tune_stream(&s, keepalive);
+                    conn_guard = Some(ConnGuard::new(pool, cand));
+                    break Some(s);
+                }
+                _ => {
+                    if pool.health_check() {
+                        pool.set_healthy(cand, false);
+                    }
                 }
             }
         }
     };
-    let _guard = ConnGuard::new(pool, idx);
+    let _guard = conn_guard;
     let _active = ActiveGuard::new(bm.clone());
 
     if pool.mode == Mode::Terminate {
-        // Dialer for the h2 gateway: reconnects per multiplexed stream (unused
-        // on the HTTP/1.1 path, which uses the pre-connected `backend_tcp`).
-        let dialer = Dialer {
-            shared: shared.clone(),
-            backend: backend_name.to_string(),
-            connect_timeout,
-            keepalive,
-        };
-        let res = match shared.terminate.get(backend_name) {
+        let res = match term_ctx {
             Some(ctx) => {
-                crate::terminate::handle(buf, client, peer, &sni, backend_tcp, ctx, dialer).await
+                // Dialer for lazy / per-stream backend connects — built only on
+                // the terminate path (passthrough never needs it). Owns the
+                // shared state so each spawned h2 stream task can clone and hold
+                // it. `backend_tcp` is the pre-connected HTTP/1.1 stream (None
+                // when deferred — the handler dials on demand).
+                let dialer = Dialer {
+                    shared: shared.clone(),
+                    backend: backend_name.to_string(),
+                    connect_timeout,
+                    keepalive,
+                };
+                crate::terminate::handle(
+                    buf, client, peer, &sni, backend_tcp, ctx, dialer, idle,
+                )
+                .await
             }
             None => Ok(()), // TLS context failed to build at startup — drop
         };
@@ -753,15 +813,20 @@ async fn handle_tcp(
 
     if pool.mode == Mode::TerminateTcp {
         // Terminate TLS, then raw-tunnel to the backend (DoT etc.). Optional
-        // PROXY protocol is prepended to the backend stream.
+        // PROXY protocol is prepended to the backend stream. This path never
+        // defers, so `backend_tcp` is the pre-connected stream.
+        let backend_tcp = match backend_tcp {
+            Some(b) => b,
+            None => return Ok(()),
+        };
         let proxy_header = match pool.proxy_protocol {
             ProxyProtocol::None => None,
             ProxyProtocol::V1 => Some(proxy_protocol::v1(peer, local)),
             ProxyProtocol::V2 => Some(proxy_protocol::v2(peer, local, false)),
         };
-        let res = match shared.terminate.get(backend_name) {
+        let res = match term_ctx {
             Some(ctx) => {
-                crate::terminate::handle_raw(buf, client, backend_tcp, ctx, proxy_header).await
+                crate::terminate::handle_raw(buf, client, backend_tcp, ctx, proxy_header, idle).await
             }
             None => Ok((0, 0)), // TLS context failed to build at startup — drop
         };
@@ -788,7 +853,11 @@ async fn handle_tcp(
         return res.map(|_| ());
     }
 
-    let mut upstream = backend_tcp;
+    // Passthrough never defers its connect, so `backend_tcp` is present.
+    let mut upstream = match backend_tcp {
+        Some(b) => b,
+        None => return Ok(()),
+    };
     // PROXY protocol header carries the real client IP (the only way to pass it
     // in passthrough). `local` is what the client connected to on the router.
     let header = match pool.proxy_protocol {
@@ -1058,8 +1127,9 @@ fn spawn_health_checker(shared: Arc<Shared>) {
 // ---------------------------------------------------------------------------
 
 struct Flow {
-    upstream: Rc<UdpSocket>,
-    backend: SocketAddr,
+    /// The backend socket, `connect`ed to the chosen server so the kernel drops
+    /// datagrams from any other source. `None` until the flow is routed.
+    upstream: Option<Rc<UdpSocket>>,
     routed: bool,
     reasm: quic::CryptoReasm,
     pending: Vec<Vec<u8>>,
@@ -1079,7 +1149,7 @@ struct Flow {
 async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, shared: Arc<Shared>) {
     let sock = Rc::new(sock);
     let mut flows: HashMap<SocketAddr, Flow> = HashMap::new();
-    let mut ticks: u32 = 0;
+    let mut last_sweep = Instant::now();
     // One buffer for the worker's lifetime, cycled through recv/send the same
     // way the backend->client pump below does. io_uring needs owned buffers, so
     // it is moved into each call and handed back — not allocated per datagram.
@@ -1094,21 +1164,24 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
         };
         metrics::GLOBAL.udp_datagrams.fetch_add(1, Ordering::Relaxed);
 
-        let st = shared.state.load_full();
-        let idle = Duration::from_secs(st.cfg.timeouts.idle);
-
-        ticks = ticks.wrapping_add(1);
-        if ticks % UDP_SWEEP_EVERY == 0 {
+        // Reap idle flows on a timer, not per packet, and only touch the shared
+        // state here (the established-flow hot path below needs none of it).
+        if last_sweep.elapsed() >= UDP_SWEEP_INTERVAL {
+            let idle = Duration::from_secs(shared.state.load().cfg.timeouts.idle);
             flows.retain(|_, f| f.last.elapsed() < idle);
+            last_sweep = Instant::now();
         }
 
         if let Some(flow) = flows.get_mut(&peer) {
             flow.last = Instant::now();
             if flow.routed {
                 // The hot path for an established flow: forward the read buffer
-                // itself and take it back, no copy and no allocation.
-                let (_, slice) = flow.upstream.send_to(buf.slice(..n), flow.backend).await;
-                buf = slice.into_inner();
+                // itself on the connected socket and take it back — no copy, no
+                // allocation, and no shared-state load.
+                if let Some(up) = &flow.upstream {
+                    let (_, slice) = up.send(buf.slice(..n)).await;
+                    buf = slice.into_inner();
+                }
                 continue;
             }
             // Still collecting the ClientHello: these copies are bounded by the
@@ -1120,7 +1193,8 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
             continue;
         }
 
-        // New flow.
+        // New flow — the one place that needs the shared state (ACL + capacity).
+        let st = shared.state.load_full();
         if let Some(acl) = st.acls.get(listener_idx).and_then(|a| a.as_ref()) {
             if !acl.ip_allowed(peer.ip()) {
                 continue; // IP not permitted on this listener
@@ -1130,8 +1204,7 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
             continue; // shed load rather than grow unbounded
         }
         let mut flow = Flow {
-            upstream: Rc::new(dummy_udp()), // replaced on routing
-            backend: local, // placeholder, set on routing
+            upstream: None, // set on routing
             routed: false,
             reasm: quic::CryptoReasm::new(),
             pending: vec![buf[..n].to_vec()],
@@ -1202,10 +1275,14 @@ async fn route_udp(
             return;
         }
     };
-    let bm = metrics::backend(backend_name);
+    let bm = pool.metrics.clone();
     let idx = pool.pick();
     let addr = pool.addr(idx);
 
+    // Connected backend socket: `send`/`recv` (no per-datagram destination, so
+    // no FIB lookup on the send path) and — the security point — the kernel
+    // delivers only datagrams from `addr`, so nobody who guesses the ephemeral
+    // source port can inject forged "backend" replies toward the client.
     let up = match connect_udp(addr) {
         Ok(u) => Rc::new(u),
         Err(e) => {
@@ -1226,21 +1303,20 @@ async fn route_udp(
     match pool.proxy_protocol {
         ProxyProtocol::None => {}
         ProxyProtocol::V1 => {
-            let _ = up.send_to(proxy_protocol::v1(peer, local), addr).await.0;
+            let _ = up.send(proxy_protocol::v1(peer, local)).await.0;
         }
         ProxyProtocol::V2 => {
-            let _ = up.send_to(proxy_protocol::v2(peer, local, true), addr).await.0;
+            let _ = up.send(proxy_protocol::v2(peer, local, true)).await.0;
         }
     }
 
     let idle = Duration::from_secs(st.cfg.timeouts.idle);
     let Some(flow) = flows.get_mut(&peer) else { return };
-    flow.upstream = up.clone();
-    flow.backend = addr;
+    flow.upstream = Some(up.clone());
     flow.routed = true;
     let pending = std::mem::take(&mut flow.pending);
     for d in pending {
-        let _ = up.send_to(d, addr).await.0;
+        let _ = up.send(d).await.0;
     }
 
     // Pump backend -> client for this flow.
@@ -1248,14 +1324,14 @@ async fn route_udp(
     monoio::spawn(async move {
         let mut buf = vec![0u8; UDP_DGRAM_MAX];
         loop {
-            let (res, b) = match monoio::time::timeout(idle, up.recv_from(buf)).await {
+            let (res, b) = match monoio::time::timeout(idle, up.recv(buf)).await {
                 Ok(v) => v,
                 Err(_) => break,
             };
             buf = b;
             let n = match res {
-                Ok((0, _)) => break,
-                Ok((n, _)) => n,
+                Ok(0) => break,
+                Ok(n) => n,
                 Err(_) => break,
             };
             let (sres, slice) = sock.send_to(buf.slice(..n), peer).await;
@@ -1267,9 +1343,11 @@ async fn route_udp(
     });
 }
 
-/// A fresh unconnected UDP socket for talking to a backend. Left unconnected on
-/// purpose: we address the backend with `send_to`, and a `send_to` with an
-/// explicit destination on a *connected* UDP socket can return `EISCONN`.
+/// A UDP socket `connect`ed to a backend. Connecting (rather than leaving it
+/// open) does two things: `send`/`recv` skip the per-datagram route lookup, and
+/// the kernel drops any datagram whose source isn't `backend` — so a third party
+/// can't inject forged replies into the flow. We use `send`, never `send_to`, so
+/// there's no `EISCONN`.
 fn connect_udp(backend: SocketAddr) -> io::Result<UdpSocket> {
     let bind: SocketAddr = if backend.is_ipv6() {
         "[::]:0".parse().unwrap()
@@ -1277,26 +1355,49 @@ fn connect_udp(backend: SocketAddr) -> io::Result<UdpSocket> {
         "0.0.0.0:0".parse().unwrap()
     };
     let std_sock = std::net::UdpSocket::bind(bind)?;
+    std_sock.connect(backend)?;
     UdpSocket::from_std(std_sock)
-}
-
-fn dummy_udp() -> UdpSocket {
-    // Placeholder before a flow is routed; never sent on.
-    let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind loopback");
-    UdpSocket::from_std(s).expect("from_std loopback")
 }
 
 // ---------------------------------------------------------------------------
 // Socket setup
 // ---------------------------------------------------------------------------
 
-fn reuseport_tcp(addr: SocketAddr, l: &crate::config::Listener) -> io::Result<std::net::TcpListener> {
+fn reuseport_tcp(
+    addr: SocketAddr,
+    l: &crate::config::Listener,
+    defer_accept_secs: u32,
+) -> io::Result<std::net::TcpListener> {
     let sock = new_reuseport_socket(addr, Type::STREAM, SockProto::TCP)?;
     if l.fast_open {
         set_tcp_fastopen(&sock, l.fast_open_qlen())?;
     }
+    // Every protocol we route is client-speaks-first (TLS ClientHello). Defer the
+    // accept until the client's first data arrives, so accept hands us a socket
+    // with the ClientHello already there — one fewer wakeup, and silent SYN-only
+    // scanners never surface into user space. Best effort; a kernel that refuses
+    // just falls back to normal accept.
+    set_tcp_defer_accept(&sock, defer_accept_secs);
     sock.listen(l.backlog() as i32)?;
     Ok(sock.into())
+}
+
+/// `TCP_DEFER_ACCEPT`: don't complete an accept until data arrives (or `secs`
+/// elapse). socket2 0.5 has no wrapper. Non-fatal — logged nowhere, since a
+/// socket without it merely wakes a touch earlier.
+fn set_tcp_defer_accept(sock: &Socket, secs: u32) {
+    let v: libc::c_int = secs.max(1) as libc::c_int;
+    // SAFETY: fd is owned by `sock` and outlives the call; `v` is a valid c_int
+    // of the size the option expects.
+    unsafe {
+        libc::setsockopt(
+            std::os::unix::io::AsRawFd::as_raw_fd(sock),
+            libc::IPPROTO_TCP,
+            libc::TCP_DEFER_ACCEPT,
+            &v as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
 }
 
 /// Enable TCP Fast Open on a listening socket. Must be set before `listen()`.

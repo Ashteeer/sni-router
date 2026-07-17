@@ -9,6 +9,7 @@
 use crate::config::{Backend, Balance, Mode, ProxyProtocol};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 pub struct Pool {
     pub servers: Vec<SocketAddr>,
@@ -17,6 +18,11 @@ pub struct Pool {
     pub balance: Balance,
     /// Connect to servers with TCP Fast Open (`backends.*.fast_open`).
     pub fast_open: bool,
+    /// This backend's metric series, resolved once at pool build. Caching the
+    /// `Arc` here keeps the per-connection hot path off the global metrics
+    /// registry `Mutex` (which every core would otherwise contend on for every
+    /// connection) — the lock is now taken only on reload, when pools rebuild.
+    pub metrics: Arc<crate::metrics::Backend>,
     health_check: bool,
     rr: AtomicUsize,
     conns: Vec<AtomicUsize>,
@@ -27,8 +33,9 @@ pub struct Pool {
 
 impl Pool {
     /// Build a pool from a validated backend. Returns `None` only if no server
-    /// address parses (the validator rejects that before we get here).
-    pub fn from_backend(b: &Backend) -> Option<Pool> {
+    /// address parses (the validator rejects that before we get here). `name`
+    /// keys the (reload-persistent) metric series cached on the pool.
+    pub fn from_backend(name: &str, b: &Backend) -> Option<Pool> {
         let servers: Vec<SocketAddr> =
             b.servers.iter().filter_map(|s| s.parse().ok()).collect();
         // redirect_https answers directly and never picks a server, so an empty
@@ -44,6 +51,7 @@ impl Pool {
             proxy_protocol: b.proxy_protocol,
             balance: b.balance,
             fast_open: b.fast_open,
+            metrics: crate::metrics::backend(name),
             health_check: b.health_check,
             rr: AtomicUsize::new(0),
             conns,
@@ -159,7 +167,7 @@ mod tests {
 
     #[test]
     fn round_robin_cycles() {
-        let p = Pool::from_backend(&backend(&["10.0.0.1:1", "10.0.0.2:2"], Balance::RoundRobin))
+        let p = Pool::from_backend("t", &backend(&["10.0.0.1:1", "10.0.0.2:2"], Balance::RoundRobin))
             .unwrap();
         let seq: Vec<usize> = (0..4).map(|_| p.pick()).collect();
         assert_eq!(seq, vec![0, 1, 0, 1]);
@@ -167,7 +175,7 @@ mod tests {
 
     #[test]
     fn least_conn_prefers_idle_server() {
-        let p = Pool::from_backend(&backend(&["10.0.0.1:1", "10.0.0.2:2"], Balance::LeastConn))
+        let p = Pool::from_backend("t", &backend(&["10.0.0.1:1", "10.0.0.2:2"], Balance::LeastConn))
             .unwrap();
         let _g = ConnGuard::new(&p, 0); // server 0 now has 1 connection
         assert_eq!(p.pick(), 1); // least loaded
@@ -177,7 +185,7 @@ mod tests {
     fn candidate_excludes_tried_and_prefers_healthy() {
         let mut b = backend(&["10.0.0.1:1", "10.0.0.2:2", "10.0.0.3:3"], Balance::RoundRobin);
         b.health_check = true;
-        let p = Pool::from_backend(&b).unwrap();
+        let p = Pool::from_backend("t", &b).unwrap();
         p.set_healthy(0, false);
         // server 0 is down, so it must not be the first candidate.
         assert_ne!(p.pick_candidate(&[]).unwrap(), 0);
@@ -189,7 +197,7 @@ mod tests {
 
     #[test]
     fn guard_decrements_on_drop() {
-        let p = Pool::from_backend(&backend(&["10.0.0.1:1"], Balance::LeastConn)).unwrap();
+        let p = Pool::from_backend("t", &backend(&["10.0.0.1:1"], Balance::LeastConn)).unwrap();
         {
             let _g = ConnGuard::new(&p, 0);
             assert_eq!(p.conns[0].load(Ordering::Relaxed), 1);

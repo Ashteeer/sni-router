@@ -14,7 +14,8 @@
 //! so `POST /update` works unprivileged; the CLI `-u` works when run as a user
 //! who can write that directory (e.g. root).
 
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// The official repository. Fixed on purpose — updates never follow a URL from
@@ -91,6 +92,12 @@ pub fn apply(tag: &str, arch: &str) -> Result<(), String> {
 
     let result = (|| {
         http_download(&url, &tarball)?;
+        // Verify the download against the release's SHA256SUMS before trusting
+        // it. TLS to github.com is not enough on its own (a corp MITM CA, a
+        // swapped asset, or a compromised transport would all pass): the binary
+        // about to overwrite the running one must match the manifest the release
+        // published, or we refuse to install it.
+        verify_sha256(&tarball, tag, &asset)?;
         run(Command::new("tar").arg("-xzf").arg(&tarball).arg("-C").arg(&work))
             .map_err(|e| format!("tar extract failed: {e}"))?;
         let new_bin = work.join("sni-router");
@@ -116,6 +123,50 @@ pub fn apply(tag: &str, arch: &str) -> Result<(), String> {
         let _ = std::fs::remove_file(&staged);
     }
     result
+}
+
+/// Verify `tarball` against the release's `SHA256SUMS` manifest. The manifest is
+/// a required release asset (one `<sha256>  <filename>` line per asset); a
+/// release without it, or without a line for `asset`, or a hash mismatch, all
+/// abort the update. Fetched from the same fixed repo as everything else.
+fn verify_sha256(tarball: &Path, tag: &str, asset: &str) -> Result<(), String> {
+    let url = format!("https://github.com/{REPO}/releases/download/{tag}/SHA256SUMS");
+    let manifest = http_get(&url).map_err(|e| {
+        format!("cannot fetch SHA256SUMS (release integrity manifest) for {tag}: {e}")
+    })?;
+    let expected = expected_hash(&manifest, asset)
+        .ok_or_else(|| format!("SHA256SUMS has no entry for {asset}"))?;
+
+    let data = std::fs::read(tarball).map_err(|e| format!("cannot read downloaded asset: {e}"))?;
+    let got = hex(Sha256::digest(&data));
+    if got != expected {
+        return Err(format!(
+            "checksum mismatch for {asset}: manifest says {expected}, download is {got} — \
+             refusing to install a binary that doesn't match the published release"
+        ));
+    }
+    Ok(())
+}
+
+/// The expected hash for `asset` from a `SHA256SUMS` manifest ("<hex>␠␠<name>"
+/// per line; the name may carry a leading `*` for binary mode). Lowercased.
+fn expected_hash(manifest: &str, asset: &str) -> Option<String> {
+    manifest.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        let hash = it.next()?;
+        let name = it.next()?;
+        (name.trim_start_matches('*') == asset).then(|| hash.to_ascii_lowercase())
+    })
+}
+
+/// Lowercase hex of a byte slice.
+fn hex(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.as_ref().len() * 2);
+    for b in bytes.as_ref() {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// CLI entry point for `sni-router -u` / `--update`.
@@ -241,7 +292,32 @@ fn scratch_dir() -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::semver;
+    use super::{expected_hash, hex, semver};
+
+    #[test]
+    fn sha256sums_parsing_picks_the_right_asset() {
+        let manifest = "\
+aaaa1111  sni-router-v1.7.0-aarch64-linux.tar.gz
+BBBB2222 *sni-router-v1.7.0-x86_64-linux.tar.gz
+cccc3333  SHA256SUMS
+";
+        // Exact asset match, binary-mode '*' stripped, hash lowercased.
+        assert_eq!(
+            expected_hash(manifest, "sni-router-v1.7.0-x86_64-linux.tar.gz").as_deref(),
+            Some("bbbb2222")
+        );
+        assert_eq!(
+            expected_hash(manifest, "sni-router-v1.7.0-aarch64-linux.tar.gz").as_deref(),
+            Some("aaaa1111")
+        );
+        // No entry -> None (an update would abort rather than install unverified).
+        assert_eq!(expected_hash(manifest, "sni-router-v9.9.9-x86_64-linux.tar.gz"), None);
+    }
+
+    #[test]
+    fn hex_encodes_lowercase() {
+        assert_eq!(hex([0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+    }
 
     #[test]
     fn version_ordering() {

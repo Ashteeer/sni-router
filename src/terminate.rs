@@ -46,7 +46,8 @@ pub struct TerminateCtx {
     /// Per-path request rules (terminate mode only; empty = forward all).
     http_rules: Vec<crate::config::HttpRule>,
     /// Whether `h2` ALPN is advertised and terminated (terminate mode only).
-    http2: bool,
+    /// Read by `server` to decide whether to defer the backend connect.
+    pub http2: bool,
     /// Live-swappable cert (updated by the reload watcher).
     resolver: Arc<SwapResolver>,
     cert_path: PathBuf,
@@ -267,28 +268,46 @@ pub async fn handle<D: BackendDial>(
     client: TcpStream,
     peer: SocketAddr,
     sni: &str,
-    backend: TcpStream,
+    backend: Option<TcpStream>,
     ctx: &TerminateCtx,
     dialer: D,
+    idle: Duration,
 ) -> io::Result<()> {
     let io = PrefixedReadIo::new(client, Cursor::new(prefix));
-    let tls = ctx
-        .acceptor
-        .accept(io)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls accept: {e}")))?;
+    // Bound the TLS handshake: a client that sent the ClientHello (already read
+    // under the handshake timeout) but then stalls mid-handshake must not hang
+    // here forever.
+    let tls = match monoio::time::timeout(idle, ctx.acceptor.accept(io)).await {
+        Ok(r) => r.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls accept: {e}")))?,
+        Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "tls handshake timeout")),
+    };
 
     // ALPN h2 (advertised only when the backend opted in): run the h2->HTTP/1.1
-    // gateway. The pre-connected `backend` is unused here — h2 multiplexes, so
-    // each stream dials its own backend connection.
+    // gateway. Any pre-connected `backend` is unused here (it is None on the
+    // deferred path) — h2 multiplexes, so each stream dials its own connection.
     if ctx.http2 && tls.alpn_protocol().as_deref() == Some(&b"h2"[..]) {
         drop(backend);
         let rules = Arc::new(ctx.http_rules.clone());
-        return h2_gateway(tls, dialer, ctx.headers, rules, peer).await;
+        return h2_gateway(tls, dialer, ctx.headers, rules, peer, idle).await;
     }
 
+    // HTTP/1.1: use the pre-connected backend, or dial now if the connect was
+    // deferred (an http2-enabled backend whose client turned out to speak h1).
+    let backend = match backend {
+        Some(b) => b,
+        None => dialer.dial().await?,
+    };
     match &ctx.backend {
-        None => http_forward(Buf::new(tls), Buf::new(backend), peer, &ctx.headers, &ctx.http_rules).await,
+        None => {
+            http_forward(
+                Buf::new(tls, Some(idle)),
+                Buf::new(backend, Some(idle)),
+                peer,
+                &ctx.headers,
+                &ctx.http_rules,
+            )
+            .await
+        }
         Some(bc) => {
             let name = bc.sni.clone().unwrap_or_else(|| sni.to_string());
             let domain = ServerName::try_from(name)
@@ -298,7 +317,14 @@ pub async fn handle<D: BackendDial>(
                 .connect(domain, backend)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("backend tls: {e}")))?;
-            http_forward(Buf::new(tls), Buf::new(btls), peer, &ctx.headers, &ctx.http_rules).await
+            http_forward(
+                Buf::new(tls, Some(idle)),
+                Buf::new(btls, Some(idle)),
+                peer,
+                &ctx.headers,
+                &ctx.http_rules,
+            )
+            .await
         }
     }
 }
@@ -314,13 +340,16 @@ pub async fn handle_raw(
     backend: TcpStream,
     ctx: &TerminateCtx,
     proxy_header: Option<Vec<u8>>,
+    idle: Duration,
 ) -> io::Result<(u64, u64)> {
     let io = PrefixedReadIo::new(client, Cursor::new(prefix));
-    let tls = ctx
-        .acceptor
-        .accept(io)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls accept: {e}")))?;
+    // Bound only the handshake; the tunnel that follows is deliberately
+    // long-lived (DoT keeps a connection open) and is reaped by TCP keepalive,
+    // not an idle read deadline that would kill a quiet-but-healthy session.
+    let tls = match monoio::time::timeout(idle, ctx.acceptor.accept(io)).await {
+        Ok(r) => r.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls accept: {e}")))?,
+        Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "tls handshake timeout")),
+    };
 
     let mut backend = backend;
     if let Some(h) = proxy_header {
@@ -343,11 +372,19 @@ pub async fn handle_raw(
 struct Buf<S> {
     s: S,
     data: Vec<u8>,
+    /// Reusable read buffer, cycled through `read` the same way splice does, so
+    /// the streaming body path allocates nothing per chunk. Lazily created.
+    scratch: Option<Vec<u8>>,
+    /// Per-read idle deadline. Bounds every user-space read on this stream, so a
+    /// client that finishes the TLS handshake and then dribbles a request head
+    /// or body (slowloris) can't pin the connection — and its pre-connected
+    /// backend — indefinitely. `None` disables it (e.g. long-lived tunnels).
+    read_timeout: Option<Duration>,
 }
 
 impl<S: AsyncReadRent + AsyncWriteRent> Buf<S> {
-    fn new(s: S) -> Self {
-        Buf { s, data: Vec::new() }
+    fn new(s: S, read_timeout: Option<Duration>) -> Self {
+        Buf { s, data: Vec::new(), scratch: None, read_timeout }
     }
 
     /// Recover the stream. Only meaningful once `data` is empty — leftover bytes
@@ -361,16 +398,17 @@ impl<S: AsyncReadRent + AsyncWriteRent> Buf<S> {
         self.data.is_empty()
     }
 
-    /// Read more bytes into the buffer. Returns false on EOF.
+    /// Read more bytes into the buffer. Returns false on EOF. Reuses `scratch`
+    /// (no per-read allocation) and honours `read_timeout`.
     async fn fill(&mut self) -> io::Result<bool> {
-        let tmp = vec![0u8; IO_CHUNK];
-        let (r, tmp) = self.s.read(tmp).await;
+        let scratch = self.scratch.take().unwrap_or_else(|| vec![0u8; IO_CHUNK]);
+        let (r, scratch) = read_timed(&mut self.s, scratch, self.read_timeout).await;
         let n = r?;
-        if n == 0 {
-            return Ok(false);
+        if n > 0 {
+            self.data.extend_from_slice(&scratch[..n]);
         }
-        self.data.extend_from_slice(&tmp[..n]);
-        Ok(true)
+        self.scratch = Some(scratch);
+        Ok(n > 0)
     }
 
     async fn write_all(&mut self, bytes: Vec<u8>) -> io::Result<()> {
@@ -414,21 +452,68 @@ impl<S: AsyncReadRent + AsyncWriteRent> Buf<S> {
 }
 
 /// Forward exactly `n` body bytes from `src` to `dst`, streaming.
+///
+/// After emptying whatever `src` already read past the head, the remainder is
+/// streamed straight from `src`'s socket into `dst`'s through one reusable
+/// buffer — no per-chunk allocation and no second copy via `src.data` (which the
+/// old `drain(..).collect()` paid on every chunk). Any bytes read past `n` (a
+/// pipelined next request) are stashed back into `src.data`.
 async fn forward_n<S, D>(src: &mut Buf<S>, dst: &mut Buf<D>, mut n: usize) -> io::Result<()>
 where
     S: AsyncReadRent + AsyncWriteRent,
     D: AsyncReadRent + AsyncWriteRent,
 {
-    while n > 0 {
-        if src.data.is_empty() && !src.fill().await? {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in body"));
-        }
+    // 1. Drain bytes already buffered past the head (bounded, one-time).
+    while n > 0 && !src.data.is_empty() {
         let take = n.min(src.data.len());
         let chunk: Vec<u8> = src.data.drain(..take).collect();
+        n -= chunk.len();
         dst.write_all(chunk).await?;
-        n -= take;
     }
+    if n == 0 {
+        return Ok(());
+    }
+    // 2. Stream the rest with a reusable buffer.
+    let mut scratch = src.scratch.take().unwrap_or_else(|| vec![0u8; IO_CHUNK]);
+    while n > 0 {
+        let (r, b) = read_timed(&mut src.s, scratch, src.read_timeout).await;
+        scratch = b;
+        let got = r?;
+        if got == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in body"));
+        }
+        let take = n.min(got);
+        let (w, slice) = dst.s.write_all(scratch.slice(..take)).await;
+        scratch = slice.into_inner();
+        w?;
+        n -= take;
+        if got > take {
+            // Over-read into the next message: keep it for the next read_head.
+            src.data.extend_from_slice(&scratch[take..got]);
+        }
+    }
+    src.scratch = Some(scratch);
     Ok(())
+}
+
+/// Read into `buf`, honouring an optional idle deadline. On timeout the in-flight
+/// buffer is lost (the caller is about to drop the connection), so an empty vec
+/// comes back with the error.
+async fn read_timed<S: AsyncReadRent>(
+    s: &mut S,
+    buf: Vec<u8>,
+    timeout: Option<Duration>,
+) -> (io::Result<usize>, Vec<u8>) {
+    match timeout {
+        Some(t) => match monoio::time::timeout(t, s.read(buf)).await {
+            Ok(v) => v,
+            Err(_) => (
+                Err(io::Error::new(io::ErrorKind::TimedOut, "idle read timeout")),
+                Vec::new(),
+            ),
+        },
+        None => s.read(buf).await,
+    }
 }
 
 /// Forward a chunked body verbatim (preserving the chunk framing).
@@ -471,14 +556,23 @@ where
     S: AsyncReadRent + AsyncWriteRent,
     D: AsyncReadRent + AsyncWriteRent,
 {
+    // Flush the buffered leftover, then cycle one reusable buffer to EOF.
+    if !src.data.is_empty() {
+        let chunk = std::mem::take(&mut src.data);
+        dst.write_all(chunk).await?;
+    }
+    let mut scratch = src.scratch.take().unwrap_or_else(|| vec![0u8; IO_CHUNK]);
     loop {
-        if !src.data.is_empty() {
-            let chunk = std::mem::take(&mut src.data);
-            dst.write_all(chunk).await?;
-        }
-        if !src.fill().await? {
+        let (r, b) = read_timed(&mut src.s, scratch, src.read_timeout).await;
+        scratch = b;
+        let got = r?;
+        if got == 0 {
+            src.scratch = Some(scratch);
             return Ok(());
         }
+        let (w, slice) = dst.s.write_all(scratch.slice(..got)).await;
+        scratch = slice.into_inner();
+        w?;
     }
 }
 
@@ -560,8 +654,8 @@ where
     C: AsyncReadRent + AsyncWriteRent + Split + 'static,
     B: AsyncReadRent + AsyncWriteRent + Split + 'static,
 {
-    let Buf { s: cs, data: cleft } = client;
-    let Buf { s: bs, data: bleft } = backend;
+    let Buf { s: cs, data: cleft, .. } = client;
+    let Buf { s: bs, data: bleft, .. } = backend;
     let (cr, mut cw) = Splitable::into_split(cs);
     let (br, mut bw) = Splitable::into_split(bs);
     // Drain whatever each side already read past the handshake.
@@ -908,20 +1002,32 @@ pub trait BackendDial: Clone + 'static {
 ///
 /// Limitations (documented): backends are spoken to over HTTP/1.1 plaintext
 /// (no re-encrypt), and server push / trailers are not forwarded.
+/// Cap on concurrent h2 streams per connection, advertised in SETTINGS. Without
+/// it one client can open a near-unbounded number of streams — each of which
+/// dials a backend — and amplify a single TCP connection into thousands of
+/// backend connections (the Rapid Reset / CVE-2023-44487 shape), sailing past
+/// `max_conns_per_ip` (which counts TCP connections, not streams).
+const H2_MAX_CONCURRENT_STREAMS: u32 = 128;
+
 async fn h2_gateway<T, D>(
     tls: T,
     dialer: D,
     headers: Headers,
     rules: Arc<Vec<HttpRule>>,
     peer: SocketAddr,
+    idle: Duration,
 ) -> io::Result<()>
 where
     T: AsyncReadRent + AsyncWriteRent + Unpin + 'static,
     D: BackendDial,
 {
-    let mut conn = h2server::handshake(tls)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {e}")))?;
+    let handshake = h2server::Builder::new()
+        .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS)
+        .handshake(tls);
+    let mut conn = match monoio::time::timeout(idle, handshake).await {
+        Ok(r) => r.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {e}")))?,
+        Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "h2 handshake timeout")),
+    };
     while let Some(result) = conn.accept().await {
         let (request, respond) = match result {
             Ok(v) => v,
@@ -930,7 +1036,7 @@ where
         let dialer = dialer.clone();
         let rules = rules.clone();
         monoio::spawn(async move {
-            if let Err(e) = h2_stream(request, respond, dialer, headers, rules, peer).await {
+            if let Err(e) = h2_stream(request, respond, dialer, headers, rules, peer, idle).await {
                 tracing::debug!(error = %e, "h2 stream error");
             }
         });
@@ -952,6 +1058,7 @@ async fn h2_stream<D: BackendDial>(
     headers: Headers,
     rules: Arc<Vec<HttpRule>>,
     peer: SocketAddr,
+    idle: Duration,
 ) -> io::Result<()> {
     let path = request.uri().path().to_string();
 
@@ -973,7 +1080,7 @@ async fn h2_stream<D: BackendDial>(
     // connection, so this is often handshake-free.
     let framing = req_body_framing(&request);
     let backend = dialer.dial().await?;
-    let mut backend = Buf::new(backend);
+    let mut backend = Buf::new(backend, Some(idle));
     let head = build_h1_request_head(&request, peer, &headers, &framing);
     backend.write_all(head).await?;
     forward_h2_body_to_h1(request.body_mut(), &mut backend, &framing).await?;

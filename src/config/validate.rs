@@ -270,6 +270,18 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
                                 "mTLS requires both client_cert and client_key (or neither)",
                             ));
                         }
+                        // Skipping backend cert verification turns the re-encrypt
+                        // leg into an unauthenticated channel (MITM-able). Legal
+                        // for a self-signed test backend, but easy to leave on by
+                        // accident — surface it, don't fail.
+                        if bt.insecure_skip_verify {
+                            d.push(Diagnostic::warning(
+                                format!("{bp}.backend_tls.insecure_skip_verify"),
+                                "backend certificate verification is disabled — the connection to \
+                                 the backend is not authenticated and can be MITM'd; use it only \
+                                 for a self-signed/test backend, never in production",
+                            ));
+                        }
                     }
                 } else {
                     // terminate_tcp is a raw byte tunnel: HTTP-only knobs are ignored.
