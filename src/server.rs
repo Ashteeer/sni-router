@@ -722,17 +722,15 @@ async fn handle_tcp(
     let bm = pool.metrics.clone();
     let connect_timeout = Duration::from_secs(st.cfg.timeouts.connect);
 
-    // The terminate TLS context (if any), fetched up front because whether we
-    // pre-connect depends on it: an http2-enabled terminate backend never uses
-    // an eagerly-opened backend connection (an h2 client dials per stream via
-    // the pool; an h1 client dials lazily inside the handler), so a pre-connect
-    // would just churn a connect+close on the backend for every client that
-    // turns out to speak h2 — skip it.
+    // The terminate TLS context (if any). `terminate` mode defers its backend
+    // connect entirely: the HTTP request loop (and the h2 gateway) obtain a
+    // backend connection per request through the pool, so an eagerly-opened one
+    // would just be discarded. `terminate_tcp` (a raw tunnel) still pre-connects.
     let term_ctx = match pool.mode {
         Mode::Terminate | Mode::TerminateTcp => shared.terminate.get(backend_name),
         _ => None,
     };
-    let defer_connect = pool.mode == Mode::Terminate && term_ctx.is_some_and(|c| c.http2);
+    let defer_connect = pool.mode == Mode::Terminate;
 
     // Connect with retry across the pool unless this backend defers its connect.
     // On failure try the next server (healthy first); a live failure also marks
@@ -775,23 +773,20 @@ async fn handle_tcp(
     let _active = ActiveGuard::new(bm.clone());
 
     if pool.mode == Mode::Terminate {
+        // `backend_tcp` is always None here (terminate defers its connect); the
+        // handler obtains backend connections per request through the dialer/pool.
         let res = match term_ctx {
             Some(ctx) => {
-                // Dialer for lazy / per-stream backend connects — built only on
-                // the terminate path (passthrough never needs it). Owns the
-                // shared state so each spawned h2 stream task can clone and hold
-                // it. `backend_tcp` is the pre-connected HTTP/1.1 stream (None
-                // when deferred — the handler dials on demand).
+                // Dialer for per-request / per-stream backend connects — built
+                // only on the terminate path (passthrough never needs it). Owns
+                // the shared state so each spawned h2 stream task can clone it.
                 let dialer = Dialer {
                     shared: shared.clone(),
                     backend: backend_name.to_string(),
                     connect_timeout,
                     keepalive,
                 };
-                crate::terminate::handle(
-                    buf, client, peer, &sni, backend_tcp, ctx, dialer, idle,
-                )
-                .await
+                crate::terminate::handle(buf, client, peer, &sni, ctx, dialer, idle).await
             }
             None => Ok(()), // TLS context failed to build at startup — drop
         };

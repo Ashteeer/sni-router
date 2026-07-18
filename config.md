@@ -281,8 +281,8 @@ simply doesn't happen. Independent of `listeners[].fast_open`, which is about
 accepting client TFO. Ignored on the udp path (no TCP connect) and by
 `redirect_https` (no backend at all).
 
-Note this is a per-*connection* saving. For `http2: true` backends the pool
-(§3.9) usually matters more, since it removes the connect entirely.
+Note this is a per-*connection* saving. For terminate backends the pool
+(§3.9, §3.10) usually matters more, since it removes the connect entirely.
 
 ### 3.5 `balance` and `health_check`
 
@@ -336,7 +336,27 @@ replaced so they cannot be spoofed.
 | `x_forwarded_for`   | `X-Forwarded-For`    | appends client IP to any existing chain |
 | `x_forwarded_proto` | `X-Forwarded-Proto`  | `https` |
 
-### 3.9 HTTP/2 backend connections
+### 3.9 Connection lifetimes (terminate, HTTP/1.1)
+
+The client↔router connection and the router↔backend connection are **independent**,
+exactly as in nginx / HAProxy / Envoy. The client connection lives by the router's
+own timeouts (`idle` / `keepalive`) and is unaffected by the backend closing its
+side: when a backend ends its keep-alive connection (its own idle timeout, an EOF,
+an error), the router transparently opens a new backend connection for the next
+request rather than dropping the client. An idempotent request (GET, HEAD, OPTIONS,
+TRACE, DELETE, PUT — with no body) whose backend connection was already dead is
+retried once on a fresh connection; a request that can't be safely replayed gets a
+`502` while the client connection stays open. Backend connections are pooled and
+reused across client connections the same way the HTTP/2 path does (see below), so
+this costs no extra connects in steady state.
+
+The backend's own `Connection` header governs only the backend hop — it is stripped
+from the response and never relayed, so a backend answering `Connection: close`
+does not close the *client's* keep-alive. (A response delimited by the backend
+closing the connection — no `Content-Length`, not chunked — is the one case where
+the client is told to close too, because that framing has no other end marker.)
+
+### 3.10 HTTP/2 backend connections
 
 With `http2: true` the router terminates h2 from the client and speaks HTTP/1.1
 to `servers`, mapping each multiplexed stream to one backend request.
@@ -361,7 +381,7 @@ Remaining limits: the backend is spoken to as **plaintext HTTP/1.1** (`http2`
 is not combinable with `backend_tls`), `least_conn` does not count h2 streams,
 and server push / trailers are not forwarded.
 
-### 3.10 Field applicability by mode
+### 3.11 Field applicability by mode
 
 `Y` = used, `—` = ignored (a WARNING is emitted if set), `req` = required.
 
