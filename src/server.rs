@@ -20,7 +20,7 @@ use crate::protocol::{proxy_protocol, quic, tls};
 use crate::router;
 
 use arc_swap::ArcSwap;
-use monoio::buf::IoBuf;
+use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::as_fd::{AsReadFd, AsWriteFd};
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::udp::UdpSocket;
@@ -41,6 +41,12 @@ use crate::metrics;
 
 const UDP_DGRAM_MAX: usize = 2048;
 const MAX_UDP_FLOWS: usize = 100_000;
+/// Room reserved at the front of the UDP worker buffer for a per-datagram PROXY
+/// protocol header. 107 is the v1 maximum from the spec (v2 IPv6 needs 52), so
+/// any header we can emit fits. Datagrams are received at this offset, which
+/// lets the header be written immediately before the payload — no memmove, no
+/// second buffer, no allocation on the hot path.
+const MAX_PP_HDR: usize = 107;
 /// How often to reap idle UDP flows. Time-based, not packet-counted: a flood of
 /// datagrams must not force a full-table scan on every Nth packet, and a quiet
 /// table must still be swept. This is only the backstop for flows that never got
@@ -1126,6 +1132,15 @@ struct Flow {
     /// datagrams from any other source. `None` until the flow is routed.
     upstream: Option<Rc<UdpSocket>>,
     routed: bool,
+    /// True once anything QUIC-shaped has been seen on this flow (a decryptable
+    /// Initial, or one that only failed AEAD). Decides both the PROXY protocol
+    /// framing and which idle timeout applies — see `route_udp`.
+    quic: bool,
+    /// PROXY protocol header to write in front of *every* datagram. `None` for
+    /// QUIC flows (header goes out once, separately) and when the backend has
+    /// `proxy_protocol: none`. Built once at routing: `peer`/`local` are fixed
+    /// for the life of the flow, so there is nothing to recompute per packet.
+    hdr: Option<Box<[u8]>>,
     reasm: quic::CryptoReasm,
     pending: Vec<Vec<u8>>,
     last: Instant,
@@ -1148,22 +1163,28 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
     // One buffer for the worker's lifetime, cycled through recv/send the same
     // way the backend->client pump below does. io_uring needs owned buffers, so
     // it is moved into each call and handed back — not allocated per datagram.
-    let mut buf = vec![0u8; UDP_DGRAM_MAX];
+    // Datagrams land at `MAX_PP_HDR`, leaving room to write a PROXY protocol
+    // header directly in front of the payload without moving either.
+    let mut buf = vec![0u8; MAX_PP_HDR + UDP_DGRAM_MAX];
 
     loop {
-        let (res, b) = sock.recv_from(buf).await;
-        buf = b;
+        let (res, slice) = sock.recv_from(buf.slice_mut(MAX_PP_HDR..)).await;
+        buf = slice.into_inner();
         let (n, peer) = match res {
             Ok(v) => v,
             Err(_) => continue,
         };
+        let end = MAX_PP_HDR + n;
         metrics::GLOBAL.udp_datagrams.fetch_add(1, Ordering::Relaxed);
 
         // Reap idle flows on a timer, not per packet, and only touch the shared
         // state here (the established-flow hot path below needs none of it).
         if last_sweep.elapsed() >= UDP_SWEEP_INTERVAL {
-            let idle = Duration::from_secs(shared.state.load().cfg.timeouts.idle);
-            flows.retain(|_, f| f.last.elapsed() < idle);
+            let (quic_idle, plain_idle) = {
+                let t = &shared.state.load().cfg.timeouts;
+                (flow_idle(t, true), flow_idle(t, false))
+            };
+            flows.retain(|_, f| f.last.elapsed() < if f.quic { quic_idle } else { plain_idle });
             last_sweep = Instant::now();
         }
 
@@ -1172,17 +1193,20 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
             if flow.routed {
                 // The hot path for an established flow: forward the read buffer
                 // itself on the connected socket and take it back — no copy, no
-                // allocation, and no shared-state load.
+                // allocation, and no shared-state load. A per-datagram PROXY
+                // header (plain UDP only) is stamped into the reserved prefix,
+                // which costs one small memcpy and still no allocation.
                 if let Some(up) = &flow.upstream {
-                    let (_, slice) = up.send(buf.slice(..n)).await;
+                    let start = stamp_pp_header(&mut buf, flow.hdr.as_deref());
+                    let (_, slice) = up.send(buf.slice(start..end)).await;
                     buf = slice.into_inner();
                 }
                 continue;
             }
             // Still collecting the ClientHello: these copies are bounded by the
             // handshake and are not the steady state.
-            flow.pending.push(buf[..n].to_vec());
-            if let Some(sni) = advance_quic(flow, &buf[..n]) {
+            flow.pending.push(buf[MAX_PP_HDR..end].to_vec());
+            if let Some(sni) = advance_quic(flow, &buf[MAX_PP_HDR..end]) {
                 route_udp(&mut flows, peer, sni, local, listener_idx, &shared, &sock).await;
             }
             continue;
@@ -1201,11 +1225,13 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
         let mut flow = Flow {
             upstream: None, // set on routing
             routed: false,
+            quic: false,
+            hdr: None, // set on routing
             reasm: quic::CryptoReasm::new(),
-            pending: vec![buf[..n].to_vec()],
+            pending: vec![buf[MAX_PP_HDR..end].to_vec()],
             last: Instant::now(),
         };
-        let decided = advance_quic(&mut flow, &buf[..n]);
+        let decided = advance_quic(&mut flow, &buf[MAX_PP_HDR..end]);
         flows.insert(peer, flow);
         if let Some(sni) = decided {
             route_udp(&mut flows, peer, sni, local, listener_idx, &shared, &sock).await;
@@ -1213,11 +1239,42 @@ async fn udp_worker(sock: UdpSocket, local: SocketAddr, listener_idx: usize, sha
     }
 }
 
+/// Write `hdr` into the reserve so it ends exactly where the received datagram
+/// begins, and return the offset the outgoing datagram now starts at. The
+/// payload is never moved: header and payload end up contiguous in the buffer
+/// the kernel already filled, so the send is one `Slice` over it.
+///
+/// `None` (QUIC, or `proxy_protocol: none`) leaves the buffer untouched and the
+/// datagram byte-exact.
+#[inline]
+fn stamp_pp_header(buf: &mut [u8], hdr: Option<&[u8]>) -> usize {
+    match hdr {
+        // len <= MAX_PP_HDR is enforced where the header is built, so this
+        // can't underflow — but saturate anyway rather than risk a panic in a
+        // path fed by remote addresses.
+        Some(h) => {
+            let start = MAX_PP_HDR.saturating_sub(h.len());
+            buf[start..MAX_PP_HDR].copy_from_slice(h);
+            start
+        }
+        None => MAX_PP_HDR,
+    }
+}
+
+/// Idle window for a UDP flow. QUIC sessions go quiet legitimately and use
+/// `timeouts.idle`; plain UDP is request/response and uses `timeouts.udp_idle`,
+/// which keeps a resolver's per-query flows from piling up.
+#[inline]
+fn flow_idle(t: &crate::config::Timeouts, quic: bool) -> Duration {
+    Duration::from_secs(if quic { t.idle } else { t.udp_idle })
+}
+
 /// Feed a datagram into the flow's QUIC reassembly. Returns `Some(sni)` once we
 /// can decide a route (`""` = route via catch-all), `None` to keep waiting.
 fn advance_quic(flow: &mut Flow, dgram: &[u8]) -> Option<String> {
     match quic::scan(dgram) {
         quic::Scan::Crypto(frags) => {
+            flow.quic = true;
             for (off, data) in frags {
                 flow.reasm.push(off, &data);
             }
@@ -1229,8 +1286,13 @@ fn advance_quic(flow: &mut Flow, dgram: &[u8]) -> Option<String> {
         }
         // Not a QUIC v1 Initial at all — treat as plain UDP, route via catch-all.
         quic::Scan::NotInitial => Some(String::new()),
-        // Fake/undecryptable Initial (Zapret fooling): ignore, wait for the real one.
-        quic::Scan::Fake => None,
+        // Fake/undecryptable Initial (Zapret fooling): ignore, wait for the real
+        // one — but the shape alone already proves this flow is QUIC, which is
+        // what decides the PROXY framing and idle timeout later.
+        quic::Scan::Fake => {
+            flow.quic = true;
+            None
+        }
     }
 }
 
@@ -1287,31 +1349,73 @@ async fn route_udp(
             return;
         }
     };
+    let is_quic = flows.get(&peer).is_some_and(|f| f.quic);
     metrics::GLOBAL.udp_flows_total.fetch_add(1, Ordering::Relaxed);
     bm.conns_total.fetch_add(1, Ordering::Relaxed);
-    tracing::info!(target: "access", %peer, sni = sni_log(&sni), backend = backend_name, mode = "quic", "flow routed");
+    let kind = if is_quic { "quic" } else { "udp" };
+    tracing::info!(target: "access", %peer, sni = sni_log(&sni), backend = backend_name, mode = kind, "flow routed");
 
-    // Optional PROXY protocol: sent once as its own leading datagram so the QUIC
-    // payload that follows stays byte-exact.
-    // ponytail: separate-datagram framing; if a backend wants it prepended to
-    // the first datagram instead, that's a one-line change here.
-    match pool.proxy_protocol {
-        ProxyProtocol::None => {}
-        ProxyProtocol::V1 => {
-            let _ = up.send(proxy_protocol::v1(peer, local)).await.0;
-        }
-        ProxyProtocol::V2 => {
-            let _ = up.send(proxy_protocol::v2(peer, local, true)).await.0;
+    // Optional PROXY protocol. The framing is not a matter of taste — the two
+    // transports need opposite things, and the router already knows which it is
+    // holding, so it picks rather than asking the user:
+    //
+    //  * QUIC — the payload is AEAD-protected end to end. One byte prepended to
+    //    an Initial and the backend's decryption fails. The header therefore
+    //    goes out once, as its own leading datagram, and every datagram after it
+    //    stays byte-exact. (A QUIC server ignores the stray leading datagram: it
+    //    is not a valid packet, and QUIC is built to survive junk on the path.)
+    //
+    //  * plain UDP (DNS, syslog, ...) — datagrams are independent and there is
+    //    no connection to carry a one-time header on. Receivers that speak PROXY
+    //    over UDP (Technitium's `DNS-over-UDP-PROXY`, dnsdist, HAProxy) parse a
+    //    header at the front of *every* datagram, and drop anything without one.
+    //    A single leading header datagram means the backend sees one malformed
+    //    query and then silently discards every real one, which is exactly what
+    //    it looked like before this existed.
+    let hdr = match pool.proxy_protocol {
+        ProxyProtocol::None => None,
+        ProxyProtocol::V1 => Some(proxy_protocol::v1(peer, local)),
+        ProxyProtocol::V2 => Some(proxy_protocol::v2(peer, local, true)),
+    };
+    let mut per_datagram_hdr: Option<Box<[u8]>> = None;
+    if let Some(h) = hdr {
+        if is_quic {
+            let _ = up.send(h).await.0;
+        } else if h.len() <= MAX_PP_HDR {
+            per_datagram_hdr = Some(h.into_boxed_slice());
+        } else {
+            // Unreachable with real addresses (v1 tops out at 107 bytes, v2 at
+            // 52), but the hot path indexes a fixed reserve — degrade to no
+            // header instead of ever panicking on undertrusted input.
+            tracing::warn!(len = h.len(), "PROXY header exceeds reserve; sending datagrams without it");
         }
     }
 
-    let idle = Duration::from_secs(st.cfg.timeouts.idle);
+    // Idle policy splits the same way. `timeouts.idle` (minutes, by default) is
+    // right for a QUIC session and disastrous for DNS: Windows resolvers take a
+    // fresh ephemeral port per query, so every query would pin a flow and a
+    // backend socket for the full idle window and the flow table would fill.
+    let idle = flow_idle(&st.cfg.timeouts, is_quic);
     let Some(flow) = flows.get_mut(&peer) else { return };
     flow.upstream = Some(up.clone());
     flow.routed = true;
+    flow.hdr = per_datagram_hdr;
     let pending = std::mem::take(&mut flow.pending);
+    // Replaying what was buffered before the route was known. Bounded by the
+    // handshake (one datagram for plain UDP), so the join allocation here never
+    // reaches the steady state.
     for d in pending {
-        let _ = up.send(d).await.0;
+        match flow.hdr.as_deref() {
+            Some(h) => {
+                let mut out = Vec::with_capacity(h.len() + d.len());
+                out.extend_from_slice(h);
+                out.extend_from_slice(&d);
+                let _ = up.send(out).await.0;
+            }
+            None => {
+                let _ = up.send(d).await.0;
+            }
+        }
     }
 
     // Pump backend -> client for this flow.
@@ -1527,6 +1631,59 @@ mod tests {
             tune_stream(&c, Some(Duration::from_secs(30)));
             assert!(c.nodelay().expect("getsockopt"), "tune_stream must set TCP_NODELAY");
         });
+    }
+
+    /// The whole point of the reserve: a PROXY header for a plain-UDP flow ends
+    /// up immediately in front of the payload the kernel already wrote, so one
+    /// datagram carries `header ++ payload` with no move and no allocation.
+    #[test]
+    fn stamp_pp_header_puts_header_flush_against_the_payload() {
+        let payload = b"\x12\x34\x01\x00"; // start of a DNS query
+        let mut buf = vec![0u8; MAX_PP_HDR + 64];
+        buf[MAX_PP_HDR..MAX_PP_HDR + payload.len()].copy_from_slice(payload);
+        let end = MAX_PP_HDR + payload.len();
+
+        let src: SocketAddr = "203.0.113.7:51234".parse().unwrap();
+        let dst: SocketAddr = "198.51.100.1:53".parse().unwrap();
+        let hdr = proxy_protocol::v2(src, dst, true);
+        assert_eq!(hdr.len(), 28, "v2 IPv4 header is 28 bytes");
+
+        let start = stamp_pp_header(&mut buf, Some(&hdr));
+        assert_eq!(start, MAX_PP_HDR - 28);
+        // What actually goes on the wire, as one datagram.
+        let dgram = &buf[start..end];
+        assert_eq!(&dgram[..28], &hdr[..], "header first");
+        assert_eq!(&dgram[28..], payload, "payload byte-exact right after it");
+    }
+
+    /// QUIC (and `proxy_protocol: none`) must stay byte-exact: nothing written,
+    /// datagram starts where the kernel put it.
+    #[test]
+    fn stamp_pp_header_none_leaves_the_datagram_untouched() {
+        let mut buf = vec![0u8; MAX_PP_HDR + 8];
+        buf[MAX_PP_HDR..].copy_from_slice(b"quicpkt!");
+        let before = buf.clone();
+        assert_eq!(stamp_pp_header(&mut buf, None), MAX_PP_HDR);
+        assert_eq!(buf, before);
+    }
+
+    /// The reserve has to fit the largest header either version can emit —
+    /// otherwise the offset arithmetic would clamp and corrupt the payload.
+    #[test]
+    fn pp_header_reserve_fits_both_versions() {
+        let v6a: SocketAddr = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535".parse().unwrap();
+        let v6b: SocketAddr = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535".parse().unwrap();
+        assert!(proxy_protocol::v1(v6a, v6b).len() <= MAX_PP_HDR);
+        assert!(proxy_protocol::v2(v6a, v6b, true).len() <= MAX_PP_HDR);
+    }
+
+    /// A short `udp_idle` must never shorten a QUIC session (Hysteria and other
+    /// long-lived tunnels sit idle for minutes on purpose).
+    #[test]
+    fn flow_idle_splits_quic_from_plain_udp() {
+        let t = crate::config::Timeouts { idle: 300, udp_idle: 30, ..Default::default() };
+        assert_eq!(flow_idle(&t, true), Duration::from_secs(300));
+        assert_eq!(flow_idle(&t, false), Duration::from_secs(30));
     }
 
     #[test]

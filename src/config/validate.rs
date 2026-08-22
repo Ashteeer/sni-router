@@ -457,6 +457,7 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         ("handshake", cfg.timeouts.handshake),
         ("connect", cfg.timeouts.connect),
         ("idle", cfg.timeouts.idle),
+        ("udp_idle", cfg.timeouts.udp_idle),
         ("health_interval", cfg.timeouts.health_interval),
         ("drain", cfg.timeouts.drain),
     ] {
@@ -466,6 +467,20 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         } else if v > 86_400 {
             d.push(Diagnostic::warning(p, format!("{v}s is unusually large (more than 24h)")));
         }
+    }
+    // A plain-UDP flow is one request/response exchange, not a session: holding
+    // one for minutes pins a backend socket per client ephemeral port, and a
+    // resolver takes a fresh port every query. Warn well before the flow table
+    // (MAX_UDP_FLOWS) becomes the thing that fails.
+    if cfg.timeouts.udp_idle > 300 {
+        d.push(Diagnostic::warning(
+            "timeouts.udp_idle",
+            format!(
+                "{}s is a long time to hold a plain-UDP flow — each one keeps a backend socket \
+                 open; QUIC flows use timeouts.idle instead, so this can stay small",
+                cfg.timeouts.udp_idle
+            ),
+        ));
     }
     // keepalive is the one timeout where 0 is meaningful (disabled), so it sits
     // outside the loop above.

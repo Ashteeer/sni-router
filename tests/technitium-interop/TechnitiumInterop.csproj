@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>technitium-interop</AssemblyName>
+    <RootNamespace>SniRouter.Interop</RootNamespace>
+    <!-- Where Technitium's sources are checked out. Override on the command
+         line: dotnet run -p:TechnitiumLibraryDir=D:\src\TechnitiumLibrary -->
+    <TechnitiumLibraryDir Condition="'$(TechnitiumLibraryDir)' == ''">$(MSBuildThisFileDirectory)..\..\..\TechnitiumLibrary</TechnitiumLibraryDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Compiled from Technitium's own source, not a copy: the test fails if
+         their parser changes in a way that stops accepting our datagrams. -->
+    <Compile Include="$(TechnitiumLibraryDir)\TechnitiumLibrary.Net\ProxyProtocol\ProxyProtocolStream.cs" />
+  </ItemGroup>
+
+</Project>

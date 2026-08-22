@@ -359,8 +359,18 @@ pub struct Timeouts {
     pub handshake: u64,
     /// Backend connect timeout.
     pub connect: u64,
-    /// Idle connection timeout.
+    /// Idle connection timeout. Also the idle window for **QUIC** flows on a
+    /// `proto: udp` listener, where a session legitimately goes quiet for a long
+    /// time (Hysteria, QUIC passthrough).
     pub idle: u64,
+    /// Idle window for **plain UDP** flows — anything on a `proto: udp` listener
+    /// that isn't QUIC: DNS, syslog, game traffic. Kept separate from `idle`
+    /// because these are request/response, not sessions: a resolver takes a
+    /// fresh ephemeral port per query, so each query pins a flow plus a backend
+    /// socket until it expires. Minutes here means tens of thousands of live
+    /// flows on a busy resolver; seconds is correct. QUIC flows never use this
+    /// value, so lowering it can't cut a long-lived tunnel.
+    pub udp_idle: u64,
     /// TCP keepalive idle time in seconds (0 = off), set on both client- and
     /// backend-facing sockets. The splice data path has no idle timeout — the
     /// kernel moves the bytes and never reports back — so keepalive is what
@@ -378,7 +388,15 @@ pub struct Timeouts {
 
 impl Default for Timeouts {
     fn default() -> Self {
-        Self { handshake: 5, connect: 10, idle: 300, keepalive: 60, health_interval: 10, drain: 30 }
+        Self {
+            handshake: 5,
+            connect: 10,
+            idle: 300,
+            udp_idle: 30,
+            keepalive: 60,
+            health_interval: 10,
+            drain: 30,
+        }
     }
 }
 

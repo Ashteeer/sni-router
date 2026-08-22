@@ -111,6 +111,19 @@ mod tests {
         assert_eq!(v2(src, dst, true)[13], 0x12); // AF_INET + DGRAM
     }
 
+    /// Cross-language contract pin. These exact bytes are fed to Technitium's
+    /// own `ProxyProtocolStream` in `tests/technitium-interop/` (a C# harness
+    /// that compiles their parser straight from source) — if this literal and
+    /// that one ever disagree, one side has drifted and the DNS-over-UDP-PROXY
+    /// path is broken again.
+    #[test]
+    fn v2_udp_wire_bytes_are_pinned() {
+        let src: SocketAddr = "203.0.113.7:51234".parse().unwrap();
+        let dst: SocketAddr = "198.51.100.1:53".parse().unwrap();
+        let hex: String = v2(src, dst, true).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "0d0a0d0a000d0a515549540a2112000ccb007107c6336401c8220035");
+    }
+
     #[test]
     fn v2_tcp6_len() {
         let src: SocketAddr = "[2001:db8::1]:1".parse().unwrap();

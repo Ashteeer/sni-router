@@ -259,8 +259,37 @@ matrix](#38-field-applicability-by-mode)):
 
 Sends the real client address to the upstream (the only way to pass it in
 passthrough, where there are no HTTP headers). `none` | `v1` (text) | `v2`
-(binary). For UDP, the header is sent as its own leading datagram. Not relevant
-to `redirect_https`.
+(binary). Not relevant to `redirect_https`.
+
+**On TCP** the header is written once, before the first forwarded byte — the
+standard framing every implementation expects.
+
+**On UDP there are two framings, and the router picks the right one itself** —
+there is no config key, because for each transport only one of them works:
+
+| flow | framing | why |
+|---|---|---|
+| **QUIC** (`proto: udp` carrying an Initial packet) | one header, sent **once** as its own leading datagram; every datagram after it is byte-exact | the payload is AEAD-protected end to end — a single prepended byte and the backend's decryption fails |
+| **plain UDP** (DNS, syslog — anything on `proto: udp` that isn't QUIC) | the header is prepended to **every** datagram | datagrams are independent and carry no session state, so there is nowhere for a one-time header to live |
+
+The router already knows which it has (it parses the QUIC Initial to get the
+SNI), so it decides per flow: anything that ever looked like QUIC gets the
+leading-datagram form, everything else gets per-datagram headers.
+
+Backends that speak PROXY over UDP — Technitium's `DNS-over-UDP-PROXY`, dnsdist,
+HAProxy — parse a header at the front of *each* datagram and drop anything
+without one, so the per-datagram form is what makes them work.
+
+Receivers are expected to reply **without** a PROXY header, to the router's
+source address; that is what the router (and every other implementation) does,
+and the return path is untouched.
+
+> **Technitium checklist** — both live in *Settings → Optional Protocols*:
+> tick **DNS-over-UDP-PROXY** (default port 538) and point the backend's
+> `servers` at that port, then add the router's IP to **Reverse Proxy Network
+> ACL** on the same page. The ACL defaults to empty, and empty denies everyone —
+> a datagram from a non-listed IP is dropped in silence, header parsed
+> correctly, no log line.
 
 ### 3.4 `fast_open`
 
@@ -465,13 +494,36 @@ http_rules:
 |-------------------|------|---------|-------|
 | `handshake`       | int  | `5`     | max time to read the full ClientHello (slowloris protection) |
 | `connect`         | int  | `10`    | backend connect timeout |
-| `idle`            | int  | `300`   | idle read timeout: UDP flows, and every user-space read in `terminate` / `terminate_tcp` / `redirect_https` (TLS handshake + HTTP request/response). Passthrough (`splice`) and established raw/WebSocket tunnels are reaped by `keepalive` instead |
+| `idle`            | int  | `300`   | idle read timeout: **QUIC** flows, and every user-space read in `terminate` / `terminate_tcp` / `redirect_https` (TLS handshake + HTTP request/response). Passthrough (`splice`) and established raw/WebSocket tunnels are reaped by `keepalive` instead |
+| `udp_idle`        | int  | `30`    | idle window for **plain UDP** flows (DNS, syslog — anything on a `proto: udp` listener that isn't QUIC); see below |
 | `keepalive`       | int  | `60`    | TCP keepalive idle time; `0` = off; see below |
 | `health_interval` | int  | `10`    | how often health‑check probes run |
 | `drain`           | int  | `30`    | on SIGTERM, how long to wait for active connections before exit |
 
 All must be `> 0` (error otherwise), except `keepalive`, where `0` means
-disabled. Values `> 86400` (24h) produce a WARNING.
+disabled. Values `> 86400` (24h) produce a WARNING; `udp_idle > 300` produces one
+too.
+
+### 5.0 `udp_idle` vs `idle` on a UDP listener
+
+Both cover `proto: udp`, and the router picks between them per flow by what the
+first datagrams actually were:
+
+| flow | timeout | why |
+|---|---|---|
+| QUIC (a decryptable — or merely QUIC-shaped — Initial was seen) | `idle` | a QUIC session is allowed to go quiet for minutes; Hysteria, HTTP/3 and friends must not be cut |
+| plain UDP (never looked like QUIC) | `udp_idle` | one request, one response — there is no session to keep |
+
+The split exists because a UDP flow costs a backend socket. A resolver takes a
+**fresh ephemeral port per query** (Windows always does), so with a 300s window
+a DNS listener at 300 q/s would hold ~90 000 live flows and sockets, hit the
+internal flow cap, and start dropping queries. At 30s the same load sits near
+9 000.
+
+Raise `udp_idle` if you pass a non-QUIC protocol that stays silent between
+packets for longer than 30s and cares about keeping the same backend 4‑tuple
+(WireGuard's default persistent keepalive is 25s and fits as-is). Lowering
+`idle` is never needed to control DNS flow count — that is what this key is for.
 
 ### 5.1 `keepalive`
 
@@ -763,7 +815,7 @@ Config {
   listeners?: Listener[]                      // may be empty (API-only config)
   backends?: { [name: string]: Backend }      // may be empty (API-only config)
   default_tls?: { cert: string, key: string } // shared cert for terminate backends
-  timeouts?: { handshake, connect, idle, keepalive, health_interval, drain } // ints, seconds
+  timeouts?: { handshake, connect, idle, udp_idle, keepalive, health_interval, drain } // ints, seconds
   limits?: { max_client_hello, max_conns_per_ip }                   // ints
   log?: { level: enum, format: enum }
   api?: { bind: string, token?: string, tls?: { cert: string, key: string } }

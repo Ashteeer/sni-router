@@ -42,6 +42,7 @@ your config with `sni-router -t` first.
 | Config parsing + static validation (`sni-router -t`, like `nginx -t`) | done |
 | TCP passthrough with SNI extraction (robust to fragmented ClientHello) | done |
 | PROXY protocol v1/v2 (real client IP for backends) | done |
+| PROXY protocol over UDP — per-datagram for plain UDP (DNS), leading datagram for QUIC | done |
 | UDP/QUIC passthrough (SNI from the QUIC Initial packet) | done |
 | Backend pools: round-robin / least-conn | done |
 | TLS termination mode + `X-Forwarded-*` header injection | done |

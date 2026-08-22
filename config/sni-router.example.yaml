@@ -132,7 +132,11 @@ backends:
 timeouts:
   handshake: 5                  # max time to read ClientHello (slowloris protection)
   connect: 10                   # backend connect timeout
-  idle: 300                     # idle connection timeout
+  idle: 300                     # idle timeout: QUIC flows + terminate reads
+  udp_idle: 30                  # idle timeout for plain-UDP flows (DNS etc).
+                                # Separate from `idle` because every flow costs a
+                                # backend socket and resolvers use a new source
+                                # port per query. QUIC never uses this value.
   keepalive: 60                 # TCP keepalive idle time, both legs (0 = off).
                                 # Reaps peers that vanished without a FIN/RST —
                                 # the splice path has no idle timeout of its own.
