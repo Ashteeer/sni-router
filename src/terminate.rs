@@ -279,7 +279,7 @@ pub async fn handle<D: BackendDial>(
     // under the handshake timeout) but then stalls mid-handshake must not hang
     // here forever.
     let tls = match monoio::time::timeout(idle, ctx.acceptor.accept(io)).await {
-        Ok(r) => r.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls accept: {e}")))?,
+        Ok(r) => r.map_err(|e| tls_err("tls accept", e))?,
         Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "tls handshake timeout")),
     };
 
@@ -309,6 +309,18 @@ pub async fn handle<D: BackendDial>(
     }
 }
 
+/// Turn a `monoio_rustls` error into one that still says what happened.
+///
+/// `TlsError`'s own `Display` is the bare word `"io error"` / `"rustls error"`
+/// — formatting it drops the cause, so an access log could only report that
+/// *something* went wrong during the handshake. Its `Into<io::Error>` keeps
+/// both the message and the kind, which is what tells a reset apart from a
+/// client that walked away mid-handshake.
+fn tls_err(ctx: &str, e: monoio_rustls::TlsError) -> io::Error {
+    let e: io::Error = e.into();
+    io::Error::new(e.kind(), format!("{ctx}: {e}"))
+}
+
 /// `mode: terminate_tcp` — terminate the client's TLS, then forward the
 /// decrypted bytes to the backend as a **raw TCP tunnel** (no HTTP parsing).
 /// `prefix` is the ClientHello already read; `proxy_header` (optional PROXY
@@ -327,7 +339,7 @@ pub async fn handle_raw(
     // long-lived (DoT keeps a connection open) and is reaped by TCP keepalive,
     // not an idle read deadline that would kill a quiet-but-healthy session.
     let tls = match monoio::time::timeout(idle, ctx.acceptor.accept(io)).await {
-        Ok(r) => r.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls accept: {e}")))?,
+        Ok(r) => r.map_err(|e| tls_err("tls accept", e))?,
         Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "tls handshake timeout")),
     };
 
@@ -638,7 +650,7 @@ impl<D: BackendDial> BackendChan for TlsChan<D> {
             .connector
             .connect(self.server.clone(), tcp)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("backend tls: {e}")))?;
+            .map_err(|e| tls_err("backend tls", e))?;
         Ok((Buf::new(tls, Some(self.idle)), false))
     }
     fn put(&self, b: Buf<Self::Stream>) -> Option<Buf<Self::Stream>> {
@@ -1361,8 +1373,12 @@ async fn h2_stream<D: BackendDial>(
     let head = build_h1_request_head(&request, peer, &headers, &framing);
     let bodyless = matches!(framing, ReqBody::None);
     let mut attempt = 0u8;
+    let mut first_pooled = false;
     let (rhead, mut backend) = loop {
         let (s, reused) = dialer.dial().await?;
+        if attempt == 0 {
+            first_pooled = reused; // the attempt that can lose the peek->write race
+        }
         let mut backend = Buf::new(s, Some(idle));
         if backend.write_all(head.clone()).await.is_err() {
             drop(backend);
@@ -1389,6 +1405,19 @@ async fn h2_stream<D: BackendDial>(
         }
     };
     let keep_alive = h1_keeps_alive(&rhead);
+    // Same per-request line the HTTP/1.1 loop emits, so `log.level: debug`
+    // answers the same questions once a client negotiates h2.
+    tracing::debug!(
+        target: "access",
+        %peer,
+        method = %request.method(),
+        path = %path,
+        status = status_of(&rhead).unwrap_or(0),
+        pooled = first_pooled,
+        retried = attempt > 0,
+        proto = "h2",
+        "request forwarded"
+    );
     let (resp, body) = h1_head_to_h2_response(&rhead)?;
     let end = matches!(body, Body::None);
     let mut send = respond.send_response(resp, end).map_err(h2_io)?;

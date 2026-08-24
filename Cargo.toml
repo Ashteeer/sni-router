@@ -1,6 +1,6 @@
 [package]
 name = "sni-router"
-version = "1.8.1"
+version = "1.8.2"
 edition = "2021"
 description = "High-performance SNI-aware edge router for Linux: TCP/UDP/QUIC passthrough plus TLS termination (HTTP/1.1, HTTP/2, WebSocket, DoT) on io_uring/monoio"
 license = "Apache-2.0"
@@ -53,7 +53,7 @@ arc-swap = "1"
 # Structured logging. Runtime-agnostic (not tokio-bound); `env-filter`/`regex`
 # left out on purpose — the level comes from config/`RUST_LOG` bare level.
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi", "json"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi", "json", "registry"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
