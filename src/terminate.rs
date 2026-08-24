@@ -29,6 +29,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::io::{self, Cursor};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -271,6 +272,7 @@ pub async fn handle<D: BackendDial>(
     ctx: &TerminateCtx,
     dialer: D,
     idle: Duration,
+    stats: Rc<Stats>,
 ) -> io::Result<()> {
     let io = PrefixedReadIo::new(client, Cursor::new(prefix));
     // Bound the TLS handshake: a client that sent the ClientHello (already read
@@ -285,7 +287,7 @@ pub async fn handle<D: BackendDial>(
     // gateway. h2 multiplexes, so each stream dials its own backend connection.
     if ctx.http2 && tls.alpn_protocol().as_deref() == Some(&b"h2"[..]) {
         let rules = Arc::new(ctx.http_rules.clone());
-        return h2_gateway(tls, dialer, ctx.headers, rules, peer, idle).await;
+        return h2_gateway(tls, dialer, ctx.headers, rules, peer, idle, stats).await;
     }
 
     // HTTP/1.1: the request loop obtains a backend connection per request through
@@ -295,14 +297,14 @@ pub async fn handle<D: BackendDial>(
     match &ctx.backend {
         None => {
             let chan = PlainChan { dialer, idle };
-            http_forward(client, chan, peer, &ctx.headers, &ctx.http_rules).await
+            http_forward(client, chan, peer, &ctx.headers, &ctx.http_rules, &stats).await
         }
         Some(bc) => {
             let name = bc.sni.clone().unwrap_or_else(|| sni.to_string());
             let server = ServerName::try_from(name)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid backend SNI"))?;
             let chan = TlsChan { dialer, connector: bc.connector.clone(), server, idle };
-            http_forward(client, chan, peer, &ctx.headers, &ctx.http_rules).await
+            http_forward(client, chan, peer, &ctx.headers, &ctx.http_rules, &stats).await
         }
     }
 }
@@ -345,6 +347,22 @@ pub async fn handle_raw(
 // ---------------------------------------------------------------------------
 // HTTP/1.1 forwarding
 // ---------------------------------------------------------------------------
+
+/// Per-connection counters for the terminate access log.
+///
+/// `Cell`, not atomics: a connection is handled start-to-finish on one core
+/// (thread-per-core, no work stealing), so there is nothing to synchronise with.
+/// Without these the access log said only "connection closed" — indistinguishable
+/// between "client did one request and left", "client idled out" and "TLS never
+/// completed", which is exactly what you need to tell apart when a client keeps
+/// reconnecting.
+#[derive(Default)]
+pub struct Stats {
+    /// HTTP requests forwarded (or answered) on this connection.
+    pub requests: std::cell::Cell<u32>,
+    /// The connection became a raw tunnel via `101 Switching Protocols`.
+    pub upgraded: std::cell::Cell<bool>,
+}
 
 /// A stream with a read-ahead buffer. Writes go straight to the stream.
 struct Buf<S> {
@@ -572,8 +590,9 @@ where
 /// for its whole life, so the backend's keep-alive close tore down the client.)
 trait BackendChan {
     type Stream: AsyncReadRent + AsyncWriteRent + Split + 'static;
-    /// A ready backend connection: a reused live one when available, else new.
-    fn dial(&self) -> impl std::future::Future<Output = io::Result<Buf<Self::Stream>>>;
+    /// A ready backend connection plus whether it was reused (pooled) rather
+    /// than freshly opened.
+    fn dial(&self) -> impl std::future::Future<Output = io::Result<(Buf<Self::Stream>, bool)>>;
     /// Offer a used, cleanly-drained, keep-alive connection back. `Some` = hold
     /// it for the next request on this client connection; `None` = it was handed
     /// off (e.g. to the shared pool), so `dial` again next time.
@@ -588,8 +607,9 @@ struct PlainChan<D: BackendDial> {
 
 impl<D: BackendDial> BackendChan for PlainChan<D> {
     type Stream = TcpStream;
-    async fn dial(&self) -> io::Result<Buf<TcpStream>> {
-        Ok(Buf::new(self.dialer.dial().await?, Some(self.idle)))
+    async fn dial(&self) -> io::Result<(Buf<TcpStream>, bool)> {
+        let (s, reused) = self.dialer.dial().await?;
+        Ok((Buf::new(s, Some(self.idle)), reused))
     }
     fn put(&self, b: Buf<TcpStream>) -> Option<Buf<TcpStream>> {
         // Back to the shared idle pool for cross-connection reuse; re-dial next
@@ -609,17 +629,17 @@ struct TlsChan<D: BackendDial> {
 
 impl<D: BackendDial> BackendChan for TlsChan<D> {
     type Stream = monoio_rustls::ClientTlsStream<TcpStream>;
-    async fn dial(&self) -> io::Result<Buf<Self::Stream>> {
+    async fn dial(&self) -> io::Result<(Buf<Self::Stream>, bool)> {
         // A re-encrypt backend never returns raw sockets to the pool, so the
         // pool for its address is always empty and this is a fresh TCP connect
         // underneath — no chance of TLS-handshaking over a pooled plaintext one.
-        let tcp = self.dialer.dial().await?;
+        let (tcp, _) = self.dialer.dial().await?;
         let tls = self
             .connector
             .connect(self.server.clone(), tcp)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("backend tls: {e}")))?;
-        Ok(Buf::new(tls, Some(self.idle)))
+        Ok((Buf::new(tls, Some(self.idle)), false))
     }
     fn put(&self, b: Buf<Self::Stream>) -> Option<Buf<Self::Stream>> {
         Some(b) // hold across requests; TLS streams don't go in the raw pool
@@ -645,6 +665,7 @@ async fn http_forward<C, Ch>(
     peer: SocketAddr,
     headers: &Headers,
     rules: &[HttpRule],
+    stats: &Stats,
 ) -> io::Result<()>
 where
     C: AsyncReadRent + AsyncWriteRent + Split + 'static,
@@ -664,6 +685,7 @@ where
         // Path rules answer directly, no backend.
         if let Some(rule) = match_rule(rules, request_path(&head)) {
             if rule.action != HttpAction::Forward {
+                stats.requests.set(stats.requests.get() + 1);
                 skip_body(&mut client, &head).await?;
                 let resp = synthetic_response(rule, request_host(&head), request_path(&head), true);
                 client.write_all(resp).await?;
@@ -673,28 +695,35 @@ where
 
         let (rewritten, method) = rewrite_request(&head, peer, headers)?;
         let framing = body_len(&head, true, false)?;
-        let has_body = !matches!(framing, Body::None);
+        let has_body = body_present(&framing);
         let is_head = method.eq_ignore_ascii_case("HEAD");
-        // Retry a failed forward on a fresh connection only when the request can
-        // be replayed verbatim: idempotent method AND no body to re-stream.
-        let can_retry = is_idempotent(&method) && !has_body;
+        stats.requests.set(stats.requests.get() + 1);
 
         // Acquire a backend, send the request, read the response head — retrying
         // once on a fresh connection if a reused one turned out to be dead.
         let mut attempt = 0u8;
+        let mut retried = false;
+        let mut from_pool = false;
         let outcome: Result<(Vec<u8>, Buf<Ch::Stream>), FwdFail> = loop {
-            let mut backend = match held.take() {
-                Some(b) => b,
+            let (mut backend, reused) = match held.take() {
+                Some(b) => (b, true), // held across requests == already used once
                 None => match chan.dial().await {
-                    Ok(b) => b,
+                    Ok(v) => v,
                     Err(_) => break Err(FwdFail::BeforeBody),
                 },
             };
-            // Send the request head.
+            if attempt == 0 {
+                from_pool = reused; // report the *first* attempt: that's the one that can fail
+            }
+            // Send the request head. A failure here consumed nothing from the
+            // client (the body, if any, is still unread), so the request can be
+            // replayed verbatim whatever its method — the backend cannot have
+            // acted on a request whose head never fully landed.
             if backend.write_all(rewritten.clone()).await.is_err() {
                 drop(backend);
-                if attempt == 0 && can_retry {
+                if attempt == 0 {
                     attempt += 1;
+                    retried = true;
                     continue;
                 }
                 break Err(FwdFail::BeforeBody); // nothing consumed from the client yet
@@ -714,13 +743,23 @@ where
                     return Err(e);
                 }
             }
-            // Read the response head.
+            // Read the response head. The request is on the wire now, so a
+            // replay must be provably harmless: nothing left to re-stream
+            // (`!has_body`) AND either an idempotent method or — the case that
+            // matters for polling protocols, which are all POST — a *pooled*
+            // connection. A pooled one that dies without answering was already
+            // closing when the request arrived (the classic closed-idle race),
+            // so the backend never processed it. This is what `Go`'s transport
+            // and nginx's `proxy_next_upstream` do; without it every lost race
+            // turns a healthy long poll into a 502.
+            let can_retry = replayable(&method, has_body, reused);
             match backend.read_head().await {
                 Ok(Some(rhead)) => break Ok((rhead, backend)),
                 _ => {
                     drop(backend);
                     if attempt == 0 && can_retry {
                         attempt += 1;
+                        retried = true;
                         continue;
                     }
                     break Err(FwdFail::Consumed); // body (if any) already consumed
@@ -736,6 +775,16 @@ where
                 if fail == FwdFail::BeforeBody && has_body {
                     skip_body(&mut client, &head).await?; // drain to realign
                 }
+                tracing::debug!(
+                    target: "access",
+                    %peer,
+                    method = %method,
+                    path = request_path(&head),
+                    status = 502,
+                    pooled = from_pool,
+                    retried,
+                    "request failed"
+                );
                 client.write_all(bad_gateway()).await?;
                 continue;
             }
@@ -743,10 +792,22 @@ where
 
         // --- response back to the client ---
         let status = status_of(&rhead);
+        tracing::debug!(
+            target: "access",
+            %peer,
+            method = %method,
+            path = request_path(&head),
+            status = status.unwrap_or(0),
+            pooled = from_pool,
+            retried,
+            n = stats.requests.get(),
+            "request forwarded"
+        );
         let body = body_len(&rhead, false, is_head)?;
         // 101 Switching Protocols: framing ends here. Forward the head verbatim
         // (Connection/Upgrade must survive) and hand off to a raw tunnel.
         if status == Some(101) {
+            stats.upgraded.set(true);
             client.write_all(rhead).await?;
             return upgrade_tunnel(client, backend).await;
         }
@@ -773,6 +834,29 @@ where
             None // Connection: close or leftover bytes → drop it, re-dial next time
         };
     }
+}
+
+/// Does this framing actually carry bytes? `Content-Length: 0` does not: there
+/// is nothing to stream and nothing to replay, so it must not block a retry.
+fn body_present(b: &Body) -> bool {
+    !matches!(b, Body::None | Body::Length(0))
+}
+
+/// May a request that reached the backend but got no response head be replayed
+/// on a fresh connection? Both conditions are required:
+///
+/// * **nothing to re-stream** — a forwarded body is gone from the client stream;
+/// * **the replay can't duplicate an effect** — either an idempotent method, or
+///   a *pooled* connection, which the backend had already decided to close
+///   before this request arrived (the closed-idle race), so it never processed
+///   it. A *fresh* connection that dies is a real backend failure, and a
+///   non-idempotent request must not be repeated after one.
+///
+/// The pooled case is what polling protocols need: their carrier requests are
+/// all `POST`, so without it every lost race turns a healthy long poll into a
+/// 502. Go's `http.Transport` and nginx's `proxy_next_upstream` draw the same line.
+fn replayable(method: &str, has_body: bool, reused: bool) -> bool {
+    !has_body && (is_idempotent(method) || reused)
 }
 
 /// Idempotent HTTP methods (RFC 9110 §9.2.2) — safe to replay on a fresh backend
@@ -1170,7 +1254,11 @@ where
 /// cache — `dial` may hand back a parked keep-alive connection instead of
 /// opening a new one.
 pub trait BackendDial: Clone + 'static {
-    fn dial(&self) -> impl std::future::Future<Output = io::Result<TcpStream>>;
+    /// A ready backend connection plus whether it came from the idle pool.
+    /// "Reused" is what makes a failed request safely retryable even when the
+    /// method is not idempotent: the backend had already decided to close that
+    /// connection before it ever saw this request (see `http_forward`).
+    fn dial(&self) -> impl std::future::Future<Output = io::Result<(TcpStream, bool)>>;
     /// Offer a connection back for reuse. Only call this on a clean message
     /// boundary: response fully consumed, keep-alive agreed, nothing buffered.
     fn release(&self, s: TcpStream);
@@ -1197,6 +1285,7 @@ async fn h2_gateway<T, D>(
     rules: Arc<Vec<HttpRule>>,
     peer: SocketAddr,
     idle: Duration,
+    stats: Rc<Stats>,
 ) -> io::Result<()>
 where
     T: AsyncReadRent + AsyncWriteRent + Unpin + 'static,
@@ -1216,8 +1305,11 @@ where
         };
         let dialer = dialer.clone();
         let rules = rules.clone();
+        let stats = stats.clone();
         monoio::spawn(async move {
-            if let Err(e) = h2_stream(request, respond, dialer, headers, rules, peer, idle).await {
+            if let Err(e) =
+                h2_stream(request, respond, dialer, headers, rules, peer, idle, stats).await
+            {
                 tracing::debug!(error = %e, "h2 stream error");
             }
         });
@@ -1240,8 +1332,10 @@ async fn h2_stream<D: BackendDial>(
     rules: Arc<Vec<HttpRule>>,
     peer: SocketAddr,
     idle: Duration,
+    stats: Rc<Stats>,
 ) -> io::Result<()> {
     let path = request.uri().path().to_string();
+    stats.requests.set(stats.requests.get() + 1);
 
     // Path rule: `respond`/`redirect` answer without touching a backend.
     if let Some(rule) = match_rule(&rules, &path) {
@@ -1258,18 +1352,41 @@ async fn h2_stream<D: BackendDial>(
     }
 
     // Forward to an HTTP/1.1 backend. `dial` may return a pooled keep-alive
-    // connection, so this is often handshake-free.
+    // connection, so this is often handshake-free — and, like any pooled
+    // connection, one the backend may already be closing. Retry once on a fresh
+    // connection under the same rules as the HTTP/1.1 loop: safe whenever the
+    // request head never fully landed, or when there is no body to replay and
+    // the dead connection came from the pool (so it can't have been processed).
     let framing = req_body_framing(&request);
-    let backend = dialer.dial().await?;
-    let mut backend = Buf::new(backend, Some(idle));
     let head = build_h1_request_head(&request, peer, &headers, &framing);
-    backend.write_all(head).await?;
-    forward_h2_body_to_h1(request.body_mut(), &mut backend, &framing).await?;
-
-    // Response back to the client as h2.
-    let rhead = match backend.read_head().await? {
-        Some(h) => h,
-        None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "backend closed early")),
+    let bodyless = matches!(framing, ReqBody::None);
+    let mut attempt = 0u8;
+    let (rhead, mut backend) = loop {
+        let (s, reused) = dialer.dial().await?;
+        let mut backend = Buf::new(s, Some(idle));
+        if backend.write_all(head.clone()).await.is_err() {
+            drop(backend);
+            if attempt == 0 {
+                attempt += 1;
+                continue; // request body untouched — replay verbatim
+            }
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "backend write failed"));
+        }
+        forward_h2_body_to_h1(request.body_mut(), &mut backend, &framing).await?;
+        match backend.read_head().await {
+            Ok(Some(h)) => break (h, backend),
+            _ => {
+                drop(backend);
+                if attempt == 0 && replayable(request.method().as_str(), !bodyless, reused) {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "backend closed early",
+                ));
+            }
+        }
     };
     let keep_alive = h1_keeps_alive(&rhead);
     let (resp, body) = h1_head_to_h2_response(&rhead)?;
@@ -1699,6 +1816,31 @@ mod tests {
 
     fn rule(path: &str, action: HttpAction, status: Option<u16>) -> HttpRule {
         HttpRule { path: path.into(), action, status, body: String::new(), content_type: None, to: None }
+    }
+
+    /// The rule that decides whether a request whose backend connection died
+    /// without answering is retried or turned into a 502. Pins both halves: the
+    /// pooled-POST case that polling carriers (one `POST` per poll) depend on,
+    /// and the fresh-connection case that must never repeat a POST.
+    #[test]
+    fn replay_allows_pooled_post_but_not_a_fresh_one() {
+        assert!(replayable("POST", false, true), "pooled connection: backend never saw it");
+        assert!(!replayable("POST", false, false), "fresh connection: a real failure");
+        assert!(replayable("GET", false, false), "idempotent replays either way");
+        assert!(!replayable("GET", true, true), "a forwarded body cannot be replayed");
+        assert!(!replayable("POST", true, true));
+    }
+
+    /// `Content-Length: 0` used to count as "has a body", which alone disabled
+    /// every retry for empty-bodied polls.
+    #[test]
+    fn zero_content_length_is_not_a_body() {
+        let poll = b"POST /api/v1/down HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n";
+        let framing = body_len(poll, true, false).unwrap();
+        assert!(matches!(framing, Body::Length(0)));
+        assert!(!body_present(&framing));
+        let up = b"POST /api/v1/up HTTP/1.1\r\nHost: h\r\nContent-Length: 7\r\n\r\n";
+        assert!(body_present(&body_len(up, true, false).unwrap()));
     }
 
     /// Guards connection reuse in the h2 gateway: a wrong `true` here would

@@ -406,6 +406,26 @@ never reused — the connection *is* the framing.
 Watch `sni_router_h2_pool_hits_total` in `/metrics`: streams served without a
 connect. Nothing to configure.
 
+**Retry on a dead pooled connection.** A pooled connection can be closed by the
+backend in the microseconds between the peek and the write. When that happens
+the router retries the request once on a fresh connection instead of answering
+`502`, provided the request can be replayed verbatim: there is no body left to
+re-stream, and either the method is idempotent (`GET`/`HEAD`/`OPTIONS`/`TRACE`/
+`DELETE`/`PUT`) **or** the failed connection came from the pool — a pooled one
+was already closing when the request arrived, so the backend never processed it.
+`Content-Length: 0` counts as *no body*. A request whose head never finished
+writing is always retried (nothing was consumed). This matters most for
+long-polling / carrier protocols, whose requests are all `POST`: without it every
+lost race turns a healthy poll into a `502` and the client reconnects.
+Both the HTTP/1.1 loop and the h2 gateway apply the same rule.
+
+**Clients that open many parallel long polls** (Telegram's WEB proxy relay, and
+anything else that keeps several streams open per origin) should be served with
+`http2: true`. Over HTTP/1.1 a browser or WebView caps an origin at ~6 concurrent
+connections, so extra polls queue behind each other; over h2 they are streams on
+one connection. Set `log.level: debug` to get one `request forwarded` line per
+request (method, path, status, `pooled`, `retried`) when diagnosing churn.
+
 Remaining limits: the backend is spoken to as **plaintext HTTP/1.1** (`http2`
 is not combinable with `backend_tls`), `least_conn` does not count h2 streams,
 and server push / trailers are not forwarded.

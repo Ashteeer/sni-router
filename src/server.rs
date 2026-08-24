@@ -567,7 +567,7 @@ impl crate::terminate::BackendDial for Dialer {
         put_idle(s);
     }
 
-    async fn dial(&self) -> io::Result<TcpStream> {
+    async fn dial(&self) -> io::Result<(TcpStream, bool)> {
         let st = self.shared.state.load_full();
         let pool = st
             .pools
@@ -583,13 +583,13 @@ impl crate::terminate::BackendDial for Dialer {
             // A parked connection skips the handshake entirely — the whole point
             // of the pool. It was tuned when it was first opened.
             if let Some(s) = take_idle(addr) {
-                return Ok(s);
+                return Ok((s, true));
             }
             let dial = connect_backend(addr, pool.fast_open);
             match monoio::time::timeout(self.connect_timeout, dial).await {
                 Ok(Ok(s)) => {
                     tune_stream(&s, self.keepalive);
-                    return Ok(s);
+                    return Ok((s, false));
                 }
                 _ => {
                     if pool.health_check() {
@@ -781,6 +781,8 @@ async fn handle_tcp(
     if pool.mode == Mode::Terminate {
         // `backend_tcp` is always None here (terminate defers its connect); the
         // handler obtains backend connections per request through the dialer/pool.
+        // Counters filled in by the handler, read back for the access log.
+        let stats = std::rc::Rc::new(crate::terminate::Stats::default());
         let res = match term_ctx {
             Some(ctx) => {
                 // Dialer for per-request / per-stream backend connects — built
@@ -792,7 +794,8 @@ async fn handle_tcp(
                     connect_timeout,
                     keepalive,
                 };
-                crate::terminate::handle(buf, client, peer, &sni, ctx, dialer, idle).await
+                crate::terminate::handle(buf, client, peer, &sni, ctx, dialer, idle, stats.clone())
+                    .await
             }
             None => Ok(()), // TLS context failed to build at startup — drop
         };
@@ -800,12 +803,20 @@ async fn handle_tcp(
             metrics::GLOBAL.conn_errors.fetch_add(1, Ordering::Relaxed);
             bm.errors.fetch_add(1, Ordering::Relaxed);
         }
+        // `requests`/`upgraded`/`error` are what make a churning client
+        // diagnosable: "closed after 1 request, no error" (the client hung up),
+        // "0 requests" (TLS or the first read never completed) and "upgraded"
+        // (a WebSocket tunnel, not the HTTP loop) are three different faults
+        // that used to log identically.
         tracing::info!(
             target: "access",
             %peer,
             sni = sni_log(&sni),
             backend = backend_name,
             mode = "terminate",
+            requests = stats.requests.get(),
+            upgraded = stats.upgraded.get(),
+            error = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
             duration_ms = start.elapsed().as_millis() as u64,
             "connection closed"
         );
