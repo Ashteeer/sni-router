@@ -43,6 +43,12 @@ pub struct Config {
     /// wins over this.
     #[serde(default)]
     pub default_tls: Option<Tls>,
+    /// Data-path tuning: io_uring ring depth and how the zero-copy forwarder
+    /// chunks its work. Every field has a working default, so the whole section
+    /// is optional and configs written before it stay valid. Applied at process
+    /// start (part of the restart signature), so an edit here fast-restarts.
+    #[serde(default)]
+    pub runtime: Runtime,
 }
 
 impl Config {
@@ -61,6 +67,70 @@ impl Config {
             .or(self.default_tls.as_ref())
     }
 }
+
+/// Data-path tuning.
+///
+/// These are the knobs that decide how many times a forwarded byte crosses the
+/// kernel boundary. None of them can change *when* a byte is forwarded: the
+/// forwarder never waits for a buffer to fill, it moves whatever has arrived,
+/// down to a single byte. They only change how much work one crossing does.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Runtime {
+    /// io_uring submission-queue depth, per core. The completion queue is twice
+    /// this. Every parked operation (one per direction of every live
+    /// connection, plus accepts) eventually lands a completion here; when more
+    /// are ready at once than the queue holds, the kernel falls back to an
+    /// overflow list — correct, but slower. Rounded **up** to a power of two by
+    /// the kernel. Costs ~96 bytes of pinned memory per entry per core.
+    pub io_uring_entries: u32,
+    /// Upper bound, in bytes, on one `splice` move in TCP passthrough.
+    ///
+    /// This is a ceiling, never a wait: `splice` returns as soon as *any* data
+    /// is available, so a single byte still leaves immediately. Raising it only
+    /// lets a burst move in fewer syscalls — 1 MiB of bulk traffic costs
+    /// `1 MiB / splice_chunk` round trips per direction.
+    pub splice_chunk: u32,
+    /// Size of the kernel pipe used as the splice staging area, in bytes.
+    /// `splice` cannot go socket-to-socket, so one pipe per direction is
+    /// unavoidable; this bounds how much can sit in it. `0` leaves whatever the
+    /// kernel's default is (64 KiB). Values above `fs.pipe-max-size` are
+    /// refused by the kernel for an unprivileged process, which silently keeps
+    /// the default — the effective size is logged at startup.
+    pub pipe_size: u32,
+    /// How many forwarding rounds one connection may run back-to-back before
+    /// yielding the core to the other connections on it.
+    ///
+    /// The forwarder drives its own syscalls, so a connection with a permanent
+    /// backlog would otherwise never give the core up. Low = fairer under many
+    /// connections; high = fewer scheduler hops on a few fat ones. `0` behaves
+    /// like `1` (yield every round).
+    pub splice_spin: u32,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            io_uring_entries: 4096,
+            splice_chunk: 64 * 1024,
+            pipe_size: 64 * 1024,
+            splice_spin: 8,
+        }
+    }
+}
+
+/// Floor monoio silently raises `io_uring_entries` to.
+pub const URING_MIN_ENTRIES: u32 = 256;
+/// Kernel ceiling for io_uring queue depth (`IORING_MAX_ENTRIES`).
+pub const URING_MAX_ENTRIES: u32 = 32_768;
+/// One page — the smallest splice move (and pipe) that makes any sense.
+pub const PAGE: u32 = 4096;
+/// Default `fs.pipe-max-size`: the largest pipe an unprivileged process may ask
+/// for unless the sysctl was raised.
+pub const PIPE_MAX_DEFAULT: u32 = 1024 * 1024;
+/// Beyond this a single connection holds the core long enough to be felt by its
+/// neighbours.
+pub const SPLICE_SPIN_MAX: u32 = 64;
 
 /// Logging: level and output format.
 #[derive(Debug, Deserialize, Serialize)]

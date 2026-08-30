@@ -572,6 +572,103 @@ Verify on a live connection: `ss -tno` shows `timer:(keepalive,…)`.
 
 ---
 
+## 6.5 `runtime` (object, optional) — data‑path tuning
+
+New in **1.9.0**. Every field has a working default, so the whole section may be
+omitted and configs written before it stay valid.
+
+```yaml
+runtime:
+  io_uring_entries: 4096
+  splice_chunk: 65536
+  pipe_size: 65536
+  splice_spin: 8
+```
+
+**None of these can add latency.** The forwarder never waits for a buffer to
+fill: `splice` returns whatever has arrived, down to a single byte, and that byte
+leaves immediately. These knobs only decide how much work one crossing into the
+kernel accomplishes, i.e. CPU and syscall count at a given throughput.
+
+| field | type | default | min | max | meaning |
+|---|---|---|---|---|---|
+| `io_uring_entries` | int | `4096` | 256 | 32768 | io_uring submission‑queue depth **per core**; the completion queue is twice this. Kernel rounds **up** to a power of two. |
+| `splice_chunk` | int (bytes) | `65536` | 4096 | `pipe_size` | Ceiling on one `splice` move in TCP passthrough. |
+| `pipe_size` | int (bytes) | `65536` | 4096 (`0` = kernel default) | `fs.pipe-max-size` (usually 1048576) | Size of the kernel pipe `splice` stages bytes through. |
+| `splice_spin` | int | `8` | 0 (= 1) | ~64 | Forwarding rounds one connection may run back‑to‑back before yielding the core. |
+
+### 6.5.1 What each one actually changes
+
+**`io_uring_entries`.** Each live connection direction parks one operation in the
+ring, plus one per accept loop and per UDP socket. When more completions are ready
+at once than the completion queue holds, the kernel falls back to an overflow
+list — correct, but slower. Memory cost is roughly `96 × entries` bytes per core
+(4096 entries ≈ 400 KiB/core).
+
+**`splice_chunk`.** Bulk traffic costs `1 MiB / splice_chunk` moves per megabyte
+per direction. At the old hard‑coded 4 KiB that was 512 moves per MiB; at 64 KiB
+it is 32. Raising it beyond `pipe_size` does nothing — the pipe caps the move.
+
+**`pipe_size`.** `splice(2)` cannot go socket‑to‑socket, so one pipe per direction
+is unavoidable. Above `fs.pipe-max-size` the kernel refuses an unprivileged
+process and silently keeps the default; the **effective** size is logged at
+startup (`data path ready … pipe_size=…`) because nothing outside the process can
+read a pipe's capacity.
+
+**`splice_spin`.** The forwarder drives its own syscalls, so a connection with a
+permanent backlog would never give the core up on its own. This bounds it.
+
+### 6.5.2 The pipe budget — why bigger is not always better
+
+Every passthrough connection owns **two** staging pipes (one per direction), and
+their pages are charged to a **per‑user** budget, `fs.pipe-user-pages-soft`
+(default 16384 pages = 64 MiB). Past that budget the kernel stops honouring the
+requested size and hands new pipes the minimum instead — silently, at runtime,
+with no error anywhere.
+
+So `pipe_size` divides how many connections can run at full chunk size:
+
+```
+concurrent connections ≈ fs.pipe-user-pages-soft × 4096 ÷ (2 × pipe_size)
+```
+
+| `pipe_size` | connections before the kernel starts shrinking (default budget) |
+|---|---|
+| 64 KiB (default) | ~512 |
+| 128 KiB | ~256 |
+| 256 KiB | ~128 |
+| 1 MiB | ~32 |
+
+If you need both a large pipe and many connections, raise the budget:
+
+```bash
+sysctl -w fs.pipe-user-pages-soft=131072   # 512 MiB of pipe pages for this user
+```
+
+`-t` computes this number for you and warns whenever `pipe_size` is above the
+64 KiB default. It cannot warn about the interaction on its own, because it does
+not know how many connections you expect.
+
+### 6.5.3 Applying changes
+
+`runtime` is part of the **restart signature**: the ring is sized when each
+per‑core runtime is built, so a change here cannot hot‑swap. `PUT /config` and
+`SIGHUP` answer `{"applied":"restart","downtime":true}` and re‑exec.
+
+### 6.5.4 Validation
+
+| condition | level |
+|---|---|
+| `io_uring_entries: 0` or `splice_chunk: 0` | **ERROR** |
+| `io_uring_entries > 32768` | **ERROR** (io_uring setup fails, worker never starts) |
+| `io_uring_entries < 256` | WARNING (raised to 256) |
+| `io_uring_entries` not a power of two | WARNING (kernel rounds up) |
+| `splice_chunk < 4096` | WARNING |
+| `splice_chunk > pipe_size` | WARNING (capped by the pipe) |
+| `pipe_size` above `fs.pipe-max-size` | WARNING (kernel refuses, default kept) |
+| `pipe_size` above 64 KiB | WARNING stating how many connections the pipe budget then allows |
+| `splice_spin > 64` | WARNING (one connection holds a core too long) |
+
 ## 7. `log` (object, optional)
 
 | field    | type            | default | notes |
@@ -839,6 +936,7 @@ Config {
   limits?: { max_client_hello, max_conns_per_ip }                   // ints
   log?: { level: enum, format: enum }
   api?: { bind: string, token?: string, tls?: { cert: string, key: string } }
+  runtime?: { io_uring_entries, splice_chunk, pipe_size, splice_spin }        // ints; see 6.5
 }
 
 Listener {

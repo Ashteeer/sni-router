@@ -148,6 +148,31 @@ limits:
   max_client_hello: 16384       # max bytes buffered while reassembling ClientHello
   max_conns_per_ip: 0           # max concurrent TCP connections per client IP (0 = off)
 
+# Data-path tuning (all optional; defaults shown). None of these can delay a
+# byte: the forwarder never waits for a buffer to fill, it moves whatever has
+# arrived, down to a single byte. They only decide how much work one crossing
+# into the kernel does. Changing any of them fast-restarts the process.
+runtime:
+  io_uring_entries: 4096        # io_uring queue depth per core (completion queue
+                                # is 2x this). Every live connection direction
+                                # parks one operation here. Rounded up to a power
+                                # of two by the kernel; max 32768.
+  splice_chunk: 65536           # ceiling on one splice move, bytes. Bulk traffic
+                                # costs 1 MiB / splice_chunk round trips per
+                                # direction, so this is throughput, not latency.
+  pipe_size: 65536              # staging pipe splice moves through (0 = kernel
+                                # default). Must be >= splice_chunk to be worth
+                                # raising. Capped by fs.pipe-max-size. NOTE: two
+                                # pipes per connection are charged to the per-user
+                                # budget fs.pipe-user-pages-soft (64 MiB), so this
+                                # size divides how many connections fit:
+                                # 64 KiB ~ 512 conns, 256 KiB ~ 128. `-t` warns
+                                # with the computed number.
+  splice_spin: 8                # forwarding rounds one connection may run before
+                                # yielding the core. Lower = fairer with many
+                                # connections, higher = fewer scheduler hops on
+                                # a few fat ones. 0 behaves like 1.
+
 # Logging.
 log:
   level: info                   # error | warn | info | debug | trace (RUST_LOG overrides)

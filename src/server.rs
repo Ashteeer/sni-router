@@ -5,8 +5,8 @@
 //! with its own accept sockets bound to the same addresses. The kernel spreads
 //! connections (and UDP 4-tuples) across the reuseport group, so no work
 //! stealing and no cross-core locking on the hot path. TCP passthrough uses
-//! kernel **zero-copy splice** (`monoio::io::zero_copy`) — data never enters
-//! user space.
+//! kernel **zero-copy splice**, driven by this module rather than by
+//! `monoio::io::zero_copy` (see [`splice_dir`]) — data never enters user space.
 //!
 //! Reloadable state (routes/backends/ACLs/timeouts) lives behind an `ArcSwap`;
 //! SIGHUP rebuilds it and swaps atomically, so live connections keep the state
@@ -21,8 +21,7 @@ use crate::router;
 
 use arc_swap::ArcSwap;
 use monoio::buf::{IoBuf, IoBufMut};
-use monoio::io::as_fd::{AsReadFd, AsWriteFd};
-use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable};
+use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::udp::UdpSocket;
 use monoio::net::{TcpListener, TcpStream};
 
@@ -30,6 +29,7 @@ use socket2::{Domain, Protocol as SockProto, Socket, Type};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -162,6 +162,10 @@ fn restart_sig(cfg: &Config) -> String {
     let _ = write!(s, "DT:{:?};", serde_norway::to_string(&cfg.default_tls).ok());
     let _ = write!(s, "API:{:?};", serde_norway::to_string(&cfg.api).ok());
     let _ = write!(s, "LOG:{:?};", serde_norway::to_string(&cfg.log).ok());
+    // The ring is sized when each per-core runtime is built, and the splice
+    // parameters are read once per connection from a section that therefore has
+    // to stay stable — so the whole block is restart-only, like the listeners.
+    let _ = write!(s, "RT:{:?};", serde_norway::to_string(&cfg.runtime).ok());
     s
 }
 
@@ -195,6 +199,7 @@ pub fn run(cfg: Config, config_path: PathBuf) -> io::Result<()> {
         conns_per_ip: std::array::from_fn(|_| Mutex::new(HashMap::new())),
     });
 
+    log_splice_setup(&shared.state.load().cfg.runtime);
     spawn_signal_thread(shared.clone());
     spawn_health_checker(shared.clone());
 
@@ -222,7 +227,12 @@ pub fn run(cfg: Config, config_path: PathBuf) -> io::Result<()> {
 /// One thread-per-core worker: sets up every listener's accept sockets and runs
 /// their loops on a dedicated monoio runtime.
 fn worker(core: usize, shared: Arc<Shared>) {
+    // Ring depth comes from the config: monoio's default (1024) is only a few
+    // hundred connections' worth of parked operations per core, and once the
+    // completion queue is full the kernel drops to its slower overflow path.
+    let entries = shared.state.load().cfg.runtime.io_uring_entries;
     let mut rt = match monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+        .with_entries(entries)
         .enable_timer()
         .build()
     {
@@ -885,10 +895,20 @@ async fn handle_tcp(
     let hello_len = buf.len() as u64;
     upstream.write_all(buf).await.0?;
 
-    let (cr, cw) = client.into_split();
-    let (ur, uw) = upstream.into_split();
-    let c2u = monoio::spawn(splice_dir(cr, uw)); // client -> backend
-    let down = splice_dir(ur, cw).await; // backend -> client
+    // The forwarder issues its own `splice`/`read` syscalls, so both sockets
+    // must be non-blocking or one of them would park the whole worker. io_uring
+    // is indifferent (it arms poll on EAGAIN by itself) and the legacy driver
+    // requires it anyway.
+    set_nonblocking(client.as_raw_fd());
+    set_nonblocking(upstream.as_raw_fd());
+    // Shared rather than split: both directions need `readable`/`writable`,
+    // which live on the whole stream. The fd still closes when the last of the
+    // two tasks drops its handle, exactly as with owned halves.
+    let scfg = SpliceCfg::from(&st.cfg.runtime);
+    let client = Rc::new(client);
+    let upstream = Rc::new(upstream);
+    let c2u = monoio::spawn(splice_dir(client.clone(), upstream.clone(), scfg)); // client -> backend
+    let down = splice_dir(upstream, client, scfg).await; // backend -> client
     let up = c2u.await + hello_len;
 
     metrics::GLOBAL.bytes_up.fetch_add(up, Ordering::Relaxed);
@@ -918,16 +938,331 @@ fn sni_log(s: &str) -> &str {
     }
 }
 
-/// Zero-copy one direction with `splice` until EOF, then close the write side.
-/// Returns the number of bytes transferred.
-async fn splice_dir<R, W>(mut r: R, mut w: W) -> u64
-where
-    R: AsReadFd,
-    W: AsWriteFd + AsyncWriteRent,
-{
-    let n = monoio::io::zero_copy(&mut r, &mut w).await.unwrap_or(0);
-    let _ = w.shutdown().await;
-    n as u64
+// ---------------------------------------------------------------------------
+// Zero-copy forwarding
+// ---------------------------------------------------------------------------
+
+/// Data-path tuning, resolved once per connection from `runtime`. (That section
+/// is part of `restart_sig`, so it cannot change under a live connection.)
+#[derive(Clone, Copy)]
+struct SpliceCfg {
+    chunk: usize,
+    pipe_size: u32,
+    spin: u32,
+}
+
+impl From<&crate::config::Runtime> for SpliceCfg {
+    fn from(r: &crate::config::Runtime) -> Self {
+        SpliceCfg {
+            chunk: r.splice_chunk.max(crate::config::PAGE) as usize,
+            pipe_size: r.pipe_size,
+            // 0 means "yield every round"; the loop counts to at least 1.
+            spin: r.splice_spin.max(1),
+        }
+    }
+}
+
+/// The kernel pipe `splice` stages bytes through.
+///
+/// `splice(2)` cannot move data socket-to-socket: one end must be a pipe. Each
+/// direction of a passthrough connection therefore owns one for its lifetime.
+struct Pipe {
+    r: RawFd,
+    w: RawFd,
+}
+
+impl Pipe {
+    /// `size` is best effort: above `fs.pipe-max-size` the kernel refuses an
+    /// unprivileged process and quietly keeps the default, which is why the
+    /// effective size is logged once at startup.
+    fn new(size: u32) -> io::Result<Pipe> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid 2-element array the call fills on success.
+        // O_CLOEXEC keeps the fds out of a re-exec; O_NONBLOCK matters because
+        // SPLICE_F_NONBLOCK alone only covers the pipe end of the move.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let p = Pipe { r: fds[0], w: fds[1] };
+        if size > 0 {
+            // SAFETY: `p.w` is a live pipe fd owned by `p`.
+            unsafe { libc::fcntl(p.w, libc::F_SETPIPE_SZ, size as libc::c_int) };
+        }
+        Ok(p)
+    }
+}
+
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        // SAFETY: both fds are owned here and unreachable after this point.
+        unsafe {
+            libc::close(self.r);
+            libc::close(self.w);
+        }
+    }
+}
+
+/// One non-blocking `splice` move. `SPLICE_F_MOVE` only — `SPLICE_F_MORE` would
+/// set `MSG_MORE` on the socket write and hold a sub-MSS segment back waiting
+/// for company, which is precisely the latency a router exists to avoid.
+#[inline]
+fn splice_raw(fd_in: RawFd, fd_out: RawFd, len: usize) -> io::Result<usize> {
+    // SAFETY: both fds are live and owned by the caller for the call's
+    // duration; null offsets mean "use the file positions", which is what a
+    // socket/pipe pair requires.
+    let n = unsafe {
+        libc::splice(
+            fd_in,
+            std::ptr::null_mut(),
+            fd_out,
+            std::ptr::null_mut(),
+            len,
+            (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32,
+        )
+    };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+#[inline]
+fn read_raw(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `fd` is live; `buf` is a valid writable region of `buf.len()`.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+#[inline]
+fn write_raw(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
+    // SAFETY: `fd` is live; `buf` is a valid readable region of `buf.len()`.
+    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// Half-close the destination so the peer sees the EOF we just saw.
+#[inline]
+fn shutdown_write(fd: RawFd) {
+    // SAFETY: `fd` is a live socket owned by the caller.
+    unsafe { libc::shutdown(fd, libc::SHUT_WR) };
+}
+
+/// Put a socket in non-blocking mode (best effort).
+fn set_nonblocking(fd: RawFd) {
+    // SAFETY: `fd` is a live socket owned by the caller.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+#[inline]
+fn would_block(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::WouldBlock
+}
+
+#[inline]
+fn interrupted(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Interrupted
+}
+
+/// Hand the core back for one turn.
+///
+/// monoio has no `yield_now`, and the forwarder below drives its own syscalls:
+/// a connection that always has more to move would otherwise stay in that loop
+/// indefinitely and starve every other connection pinned to this core.
+struct YieldNow(bool);
+
+impl std::future::Future for YieldNow {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 {
+            return std::task::Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+
+#[inline]
+fn yield_now() -> YieldNow {
+    YieldNow(false)
+}
+
+/// Forward one direction until EOF, then half-close the destination. Returns
+/// the number of bytes transferred.
+///
+/// This drives `splice(2)` itself instead of calling `monoio::io::zero_copy`,
+/// for two reasons:
+///
+/// * **One kernel round trip per move instead of two.** `zero_copy` awaits an
+///   io_uring completion for the socket->pipe half and another for the
+///   pipe->socket half, so every chunk pays two ring round trips even when the
+///   bytes are already sitting there. Here both halves are plain non-blocking
+///   syscalls on the common path, and the ring is used only to *wait* — for
+///   data to arrive or for send-buffer space, the one job it is needed for.
+/// * **The chunk is configurable.** `zero_copy` hard-codes 4 KiB, so bulk
+///   traffic pays 512 moves per megabyte per direction. `runtime.splice_chunk`
+///   raises that ceiling. It cannot add latency: `splice` never waits for a
+///   full buffer, it returns whatever has arrived, down to a single byte.
+///
+/// Where `splice` is unavailable (some containers, WSL1) the connection falls
+/// back to [`copy_dir`] instead of failing.
+async fn splice_dir(src: Rc<TcpStream>, dst: Rc<TcpStream>, cfg: SpliceCfg) -> u64 {
+    let sfd = src.as_raw_fd();
+    let dfd = dst.as_raw_fd();
+    let pipe = match Pipe::new(cfg.pipe_size) {
+        Ok(p) => p,
+        Err(_) => return copy_dir(src, dst, cfg).await,
+    };
+    let mut total = 0u64;
+    let mut spun = 0u32;
+    'copy: loop {
+        // --- source socket -> pipe ---
+        let n = loop {
+            match splice_raw(sfd, pipe.w, cfg.chunk) {
+                Ok(0) => break 'copy, // peer closed its write side
+                Ok(n) => break n,
+                Err(ref e) if would_block(e) => {
+                    spun = 0;
+                    if src.readable(false).await.is_err() {
+                        break 'copy;
+                    }
+                }
+                Err(ref e) if interrupted(e) => {}
+                // Nothing moved yet and splice already refuses: this kernel or
+                // sandbox does not support it here. Serve the connection with a
+                // user-space copy rather than dropping it.
+                Err(_) if total == 0 => return copy_dir(src, dst, cfg).await,
+                Err(_) => break 'copy,
+            }
+        };
+        total += n as u64;
+        // --- pipe -> destination socket ---
+        let mut left = n;
+        while left > 0 {
+            match splice_raw(pipe.r, dfd, left) {
+                // Cannot happen with a non-empty pipe, but returning 0 forever
+                // would spin the core, so treat it as a dead destination.
+                Ok(0) => break 'copy,
+                Ok(w) => left -= w,
+                Err(ref e) if would_block(e) => {
+                    spun = 0;
+                    if dst.writable(false).await.is_err() {
+                        break 'copy;
+                    }
+                }
+                Err(ref e) if interrupted(e) => {}
+                Err(_) => break 'copy,
+            }
+        }
+        spun += 1;
+        if spun >= cfg.spin {
+            spun = 0;
+            yield_now().await;
+        }
+    }
+    shutdown_write(dfd);
+    total
+}
+
+/// User-space fallback for [`splice_dir`]: the same loop shape with one copy
+/// through a reusable buffer. Only reached where `splice` is unavailable.
+async fn copy_dir(src: Rc<TcpStream>, dst: Rc<TcpStream>, cfg: SpliceCfg) -> u64 {
+    let sfd = src.as_raw_fd();
+    let dfd = dst.as_raw_fd();
+    let mut buf = vec![0u8; cfg.chunk];
+    let mut total = 0u64;
+    let mut spun = 0u32;
+    'copy: loop {
+        let n = loop {
+            match read_raw(sfd, &mut buf) {
+                Ok(0) => break 'copy,
+                Ok(n) => break n,
+                Err(ref e) if would_block(e) => {
+                    spun = 0;
+                    if src.readable(false).await.is_err() {
+                        break 'copy;
+                    }
+                }
+                Err(ref e) if interrupted(e) => {}
+                Err(_) => break 'copy,
+            }
+        };
+        total += n as u64;
+        let mut off = 0;
+        while off < n {
+            match write_raw(dfd, &buf[off..n]) {
+                Ok(0) => break 'copy,
+                Ok(w) => off += w,
+                Err(ref e) if would_block(e) => {
+                    spun = 0;
+                    if dst.writable(false).await.is_err() {
+                        break 'copy;
+                    }
+                }
+                Err(ref e) if interrupted(e) => {}
+                Err(_) => break 'copy,
+            }
+        }
+        spun += 1;
+        if spun >= cfg.spin {
+            spun = 0;
+            yield_now().await;
+        }
+    }
+    shutdown_write(dfd);
+    total
+}
+
+/// Report what the data path actually got, once at startup.
+///
+/// `F_SETPIPE_SZ` is best effort: above `fs.pipe-max-size` an unprivileged
+/// process is refused and the pipe silently keeps its default, and nothing
+/// outside the process can read a pipe's capacity. Same reasoning as the TFO
+/// queue readback on listeners.
+fn log_splice_setup(rt: &crate::config::Runtime) {
+    let effective = Pipe::new(rt.pipe_size).ok().and_then(|p| {
+        // SAFETY: `p.w` is a live pipe fd owned by `p` for this call.
+        let n = unsafe { libc::fcntl(p.w, libc::F_GETPIPE_SZ) };
+        (n > 0).then_some(n as u32)
+    });
+    match effective {
+        Some(bytes) => {
+            tracing::info!(
+                io_uring_entries = rt.io_uring_entries,
+                splice_chunk = rt.splice_chunk,
+                pipe_size = bytes,
+                splice_spin = rt.splice_spin,
+                "data path ready"
+            );
+            if rt.pipe_size > 0 && bytes < rt.pipe_size {
+                tracing::warn!(
+                    requested = rt.pipe_size,
+                    effective = bytes,
+                    "pipe_size refused by the kernel (raise fs.pipe-max-size); a splice_chunk \
+                     above the effective size simply moves less per call"
+                );
+            }
+        }
+        None => tracing::warn!("cannot create a splice pipe; passthrough will copy in user space"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1625,6 +1960,9 @@ fn pin_to_core(core: usize) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    // The data path calls shutdown through a raw fd; the tests drive real
+    // streams, so they need the trait method too.
+    use monoio::io::AsyncWriteRent;
 
     /// Also pins the reason the call exists: the kernel default really is Nagle
     /// on, so without `tune_stream` every forwarded byte pays for it.
@@ -1695,6 +2033,150 @@ mod tests {
         let t = crate::config::Timeouts { idle: 300, udp_idle: 30, ..Default::default() };
         assert_eq!(flow_idle(&t, true), Duration::from_secs(300));
         assert_eq!(flow_idle(&t, false), Duration::from_secs(30));
+    }
+
+    /// The tuning knobs are ceilings, and the loop needs them normalised before
+    /// it can trust them: a zero chunk would move nothing and a zero spin would
+    /// make the fairness counter never fire.
+    #[test]
+    fn splice_cfg_normalises_degenerate_values() {
+        let cfg = SpliceCfg::from(&crate::config::Runtime {
+            io_uring_entries: 4096,
+            splice_chunk: 0,
+            pipe_size: 0,
+            splice_spin: 0,
+        });
+        assert_eq!(cfg.chunk, crate::config::PAGE as usize, "chunk floors at one page");
+        assert_eq!(cfg.spin, 1, "spin 0 means yield every round, not never");
+
+        let cfg = SpliceCfg::from(&crate::config::Runtime::default());
+        assert_eq!(cfg.chunk, 64 * 1024);
+        assert_eq!(cfg.spin, 8);
+    }
+
+    /// `yield_now` must park exactly once and then finish — a future that stayed
+    /// pending would hang the forwarder, one that returned ready immediately
+    /// would never give the core up.
+    #[test]
+    fn yield_now_parks_once_then_completes() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        let mut f = yield_now();
+        let mut f = std::pin::Pin::new(&mut f);
+        assert!(matches!(f.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(f.as_mut().poll(&mut cx), Poll::Ready(())));
+    }
+
+    /// `pipe_size` is best effort, so the contract is only "never smaller than a
+    /// page and never silently broken". Skips itself where the kernel refuses to
+    /// resize pipes at all (containers with a low `fs.pipe-max-size`, WSL1),
+    /// because that is the environment talking, not a regression.
+    #[test]
+    fn pipe_size_is_applied_when_the_kernel_allows_it() {
+        let Ok(p) = Pipe::new(256 * 1024) else {
+            eprintln!("skipped: this kernel will not create a pipe here");
+            return;
+        };
+        // SAFETY: p.w is a live pipe fd owned by `p`.
+        let got = unsafe { libc::fcntl(p.w, libc::F_GETPIPE_SZ) };
+        if got <= 0 {
+            eprintln!("skipped: F_GETPIPE_SZ unsupported here");
+            return;
+        }
+        assert!(got as u32 >= crate::config::PAGE, "a pipe is at least one page: {got}");
+    }
+
+    /// Two TCP pairs wired through the forwarder: whatever goes in one end comes
+    /// out the other, byte for byte, and the reported count matches. Exercises
+    /// whichever path the environment supports — `splice` where it works, the
+    /// user-space fallback where it does not — which is the point: both must
+    /// deliver the same bytes.
+    #[test]
+    fn forwarder_moves_every_byte_in_order() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_timer()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let (mut feed, src, dst, mut drain) = wire_pair().await;
+            let cfg = SpliceCfg::from(&crate::config::Runtime::default());
+            let moved = monoio::spawn(splice_dir(Rc::new(src), Rc::new(dst), cfg));
+
+            // Bigger than one chunk so the loop runs several rounds.
+            let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+            let expect = payload.clone();
+            let writer = monoio::spawn(async move {
+                let (r, _) = feed.write_all(payload).await;
+                r.expect("write payload");
+                let _ = feed.shutdown().await;
+            });
+
+            let mut got: Vec<u8> = Vec::with_capacity(expect.len());
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                let (r, b) = drain.read(buf).await;
+                buf = b;
+                match r.expect("read") {
+                    0 => break,
+                    n => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            writer.await;
+            assert_eq!(got.len(), expect.len(), "byte count");
+            assert_eq!(got, expect, "payload survived the forwarder unchanged");
+            assert_eq!(moved.await, expect.len() as u64, "reported byte count");
+        });
+    }
+
+    /// The knob names say "chunk", so pin what a chunk is *not*: the forwarder
+    /// never waits for one to fill. A single byte written with nothing behind it
+    /// has to come out the far side on its own — that is the whole latency
+    /// contract of a router, and it must hold whatever `splice_chunk` says.
+    #[test]
+    fn a_single_byte_is_forwarded_without_waiting_for_more() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_timer()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let (mut feed, src, dst, mut drain) = wire_pair().await;
+            let cfg = SpliceCfg::from(&crate::config::Runtime::default()); // 64 KiB chunk
+            monoio::spawn(splice_dir(Rc::new(src), Rc::new(dst), cfg));
+
+            let (r, _) = feed.write_all(vec![0xA5u8]).await;
+            r.expect("write one byte");
+            // Deliberately no shutdown: nothing tells the forwarder that this is
+            // all there is, so an implementation that batched would stall here.
+            let read = monoio::time::timeout(Duration::from_secs(5), drain.read(vec![0u8; 8])).await;
+            let (res, buf) = read.expect("one byte must not wait for a full chunk");
+            assert_eq!(res.expect("read"), 1);
+            assert_eq!(buf[0], 0xA5);
+        });
+    }
+
+    /// `feed -> src ==forwarder==> dst -> drain`: two real loopback connections,
+    /// set up exactly the way `handle_tcp` does (non-blocking, since the
+    /// forwarder drives its own syscalls).
+    async fn wire_pair() -> (TcpStream, TcpStream, TcpStream, TcpStream) {
+        let l_in = TcpListener::bind("127.0.0.1:0").expect("bind in");
+        let a_in = l_in.local_addr().expect("addr in");
+        let feed = TcpStream::connect(a_in).await.expect("connect in");
+        let (src, _) = l_in.accept().await.expect("accept in");
+
+        let l_out = TcpListener::bind("127.0.0.1:0").expect("bind out");
+        let a_out = l_out.local_addr().expect("addr out");
+        let dst = TcpStream::connect(a_out).await.expect("connect out");
+        let (drain, _) = l_out.accept().await.expect("accept out");
+
+        set_nonblocking(src.as_raw_fd());
+        set_nonblocking(dst.as_raw_fd());
+        (feed, src, dst, drain)
     }
 
     #[test]

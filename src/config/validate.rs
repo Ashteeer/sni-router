@@ -491,6 +491,11 @@ pub fn validate(cfg: &Config) -> Vec<Diagnostic> {
         ));
     }
 
+    // Data-path tuning. Everything here has a working default, so these are
+    // guard rails against values that would quietly do nothing (or hurt), not
+    // required fields.
+    runtime_diags(cfg, &mut d);
+
     // Management + metrics API bind address + optional TLS cert.
     if let Some(api) = &cfg.api {
         match api.bind.parse::<SocketAddr>() {
@@ -656,6 +661,172 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Checks for the `runtime` section: ring depth, splice chunking, fairness.
+///
+/// The theme is that every one of these is a *ceiling*, not a wait — a bad
+/// value never breaks correctness, it just wastes work or starves neighbours.
+/// So almost everything here is a WARNING, and only a value that would make the
+/// data path do nothing at all is an ERROR.
+fn runtime_diags(cfg: &Config, d: &mut Vec<Diagnostic>) {
+    use crate::config::{PAGE, PIPE_MAX_DEFAULT, SPLICE_SPIN_MAX, URING_MAX_ENTRIES, URING_MIN_ENTRIES};
+    let rt = &cfg.runtime;
+
+    // --- io_uring_entries ---
+    if rt.io_uring_entries == 0 {
+        d.push(Diagnostic::error(
+            "runtime.io_uring_entries",
+            "must be greater than 0 — the runtime cannot be built without a ring",
+        ));
+    } else {
+        if rt.io_uring_entries < URING_MIN_ENTRIES {
+            d.push(Diagnostic::warning(
+                "runtime.io_uring_entries",
+                format!(
+                    "{} is below the runtime's floor and will be raised to {URING_MIN_ENTRIES}",
+                    rt.io_uring_entries
+                ),
+            ));
+        }
+        if rt.io_uring_entries > URING_MAX_ENTRIES {
+            d.push(Diagnostic::error(
+                "runtime.io_uring_entries",
+                format!(
+                    "{} exceeds the kernel maximum ({URING_MAX_ENTRIES}); io_uring setup would fail \
+                     and the worker would not start",
+                    rt.io_uring_entries
+                ),
+            ));
+        } else if !rt.io_uring_entries.is_power_of_two() {
+            d.push(Diagnostic::warning(
+                "runtime.io_uring_entries",
+                format!(
+                    "{} is not a power of two — the kernel rounds up to {}, so the memory is spent \
+                     either way",
+                    rt.io_uring_entries,
+                    rt.io_uring_entries.next_power_of_two()
+                ),
+            ));
+        }
+    }
+
+    // --- pipe_size (0 = leave the kernel default) ---
+    if rt.pipe_size != 0 {
+        if rt.pipe_size < PAGE {
+            d.push(Diagnostic::warning(
+                "runtime.pipe_size",
+                format!("{} is below one page — the kernel rounds up to {PAGE}", rt.pipe_size),
+            ));
+        }
+        if let Some(max) = pipe_max_size() {
+            if rt.pipe_size > max {
+                d.push(Diagnostic::warning(
+                    "runtime.pipe_size",
+                    format!(
+                        "{} is above fs.pipe-max-size ({max}) — the kernel refuses it for a \
+                         non-root process and the pipe keeps its default size",
+                        rt.pipe_size
+                    ),
+                ));
+            }
+        } else if rt.pipe_size > PIPE_MAX_DEFAULT {
+            d.push(Diagnostic::warning(
+                "runtime.pipe_size",
+                format!(
+                    "{} is above the usual fs.pipe-max-size ({PIPE_MAX_DEFAULT}) — if the sysctl \
+                     was not raised the kernel refuses it and keeps the default size",
+                    rt.pipe_size
+                ),
+            ));
+        }
+    }
+
+    // --- how many connections the pipe budget allows ---
+    //
+    // Every passthrough connection owns two staging pipes (one per direction),
+    // and their pages are charged to a per-user budget: past
+    // `fs.pipe-user-pages-soft` the kernel silently hands new pipes the minimum
+    // size instead of the requested one. So `pipe_size` is not just memory, it
+    // divides how many connections can run at full chunk size — which is the
+    // opposite of what "bigger is faster" suggests, and invisible at runtime.
+    if rt.pipe_size > 64 * 1024 {
+        if let Some(fit) = pipe_budget_connections(rt.pipe_size) {
+            d.push(Diagnostic::warning(
+                "runtime.pipe_size",
+                format!(
+                    "each passthrough connection uses two pipes of this size, charged to \
+                     fs.pipe-user-pages-soft — about {fit} concurrent connections fit before the \
+                     kernel starts shrinking new pipes; raise that sysctl or lower pipe_size"
+                ),
+            ));
+        }
+    }
+
+    // --- splice_chunk ---
+    if rt.splice_chunk == 0 {
+        d.push(Diagnostic::error(
+            "runtime.splice_chunk",
+            "must be greater than 0 — it is the upper bound on one forwarding move",
+        ));
+    } else if rt.splice_chunk < PAGE {
+        d.push(Diagnostic::warning(
+            "runtime.splice_chunk",
+            format!(
+                "{} is below one page; the forwarder would make more syscalls than the data \
+                 needs (it never waits to fill a chunk, so a bigger ceiling costs no latency)",
+                rt.splice_chunk
+            ),
+        ));
+    }
+    // A chunk bigger than the pipe is not wrong, just pointless: the move is
+    // capped by whatever the pipe can hold.
+    let effective_pipe = if rt.pipe_size == 0 { 64 * 1024 } else { rt.pipe_size };
+    if rt.splice_chunk > effective_pipe {
+        d.push(Diagnostic::warning(
+            "runtime.splice_chunk",
+            format!(
+                "{} is larger than the staging pipe ({effective_pipe}) — moves are capped by the \
+                 pipe, so raise runtime.pipe_size too or the extra has no effect",
+                rt.splice_chunk
+            ),
+        ));
+    }
+
+    // --- splice_spin ---
+    if rt.splice_spin > SPLICE_SPIN_MAX {
+        d.push(Diagnostic::warning(
+            "runtime.splice_spin",
+            format!(
+                "{} rounds back-to-back is a long time for one connection to hold a core; \
+                 other connections pinned to it wait",
+                rt.splice_spin
+            ),
+        ));
+    }
+}
+
+/// Roughly how many concurrent passthrough connections fit in the per-user pipe
+/// budget at `pipe_size` (two pipes each). `None` when the sysctl is unreadable
+/// or unlimited — no number is better than an invented one.
+fn pipe_budget_connections(pipe_size: u32) -> Option<u64> {
+    let soft: u64 = std::fs::read_to_string("/proc/sys/fs/pipe-user-pages-soft")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if soft == 0 {
+        return None; // 0 means the soft limit is disabled
+    }
+    let per_conn_pages = 2 * (pipe_size as u64).div_ceil(crate::config::PAGE as u64);
+    Some((soft / per_conn_pages.max(1)).max(1))
+}
+
+/// `fs.pipe-max-size`, when it is readable (not in a minimal container, not on
+/// a non-Linux build host). `None` means "cannot tell" — the caller then falls
+/// back to the documented default rather than inventing a diagnostic.
+fn pipe_max_size() -> Option<u32> {
+    std::fs::read_to_string("/proc/sys/fs/pipe-max-size").ok()?.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +862,112 @@ backends:
     fn valid_config_passes() {
         let d = validate(&cfg(VALID));
         assert!(d.is_empty(), "unexpected diagnostics: {d:?}");
+    }
+
+    /// The data-path knobs are ceilings: a wrong one wastes work, it does not
+    /// break correctness. So only a value that would leave the forwarder unable
+    /// to move anything is an error.
+    #[test]
+    fn runtime_zero_values_are_errors() {
+        let y = r#"
+listeners: []
+api:
+  bind: "127.0.0.1:9000"
+runtime:
+  io_uring_entries: 0
+  splice_chunk: 0
+"#;
+        let c: Config = serde_norway::from_str(y).expect("parse");
+        let d = validate(&c);
+        let paths: Vec<&str> = errors(&d).iter().map(|x| x.path.as_str()).collect();
+        assert!(paths.contains(&"runtime.io_uring_entries"), "{d:?}");
+        assert!(paths.contains(&"runtime.splice_chunk"), "{d:?}");
+    }
+
+    /// Above the kernel ceiling io_uring setup fails outright and the worker
+    /// never starts, so this one has to be an error rather than a warning.
+    #[test]
+    fn runtime_ring_above_the_kernel_maximum_is_an_error() {
+        let y = r#"
+listeners: []
+api:
+  bind: "127.0.0.1:9000"
+runtime:
+  io_uring_entries: 65536
+"#;
+        let c: Config = serde_norway::from_str(y).expect("parse");
+        let d = validate(&c);
+        assert!(errors(&d).iter().any(|x| x.path == "runtime.io_uring_entries"), "{d:?}");
+    }
+
+    /// A chunk bigger than the staging pipe is not wrong, just wasted intent —
+    /// the move is capped by the pipe. Warn so the operator raises both.
+    #[test]
+    fn runtime_chunk_larger_than_pipe_warns() {
+        let y = r#"
+listeners: []
+api:
+  bind: "127.0.0.1:9000"
+runtime:
+  splice_chunk: 262144
+  pipe_size: 65536
+  io_uring_entries: 3000
+"#;
+        let c: Config = serde_norway::from_str(y).expect("parse");
+        let d = validate(&c);
+        assert!(errors(&d).is_empty(), "none of this is fatal: {d:?}");
+        let w: Vec<&str> = warnings(&d).iter().map(|x| x.path.as_str()).collect();
+        assert!(w.contains(&"runtime.splice_chunk"), "chunk vs pipe: {d:?}");
+        // 3000 is not a power of two — the kernel rounds up, so the memory is
+        // spent regardless and the operator should know.
+        assert!(w.contains(&"runtime.io_uring_entries"), "power of two: {d:?}");
+    }
+
+    /// A big pipe buys throughput per connection and spends the per-user pipe
+    /// budget, which caps how many connections can have one. That trade is
+    /// invisible at runtime, so `-t` has to say it. Skips itself where the
+    /// sysctl is not readable (non-Linux build host, minimal container).
+    #[test]
+    fn runtime_large_pipe_warns_about_the_connection_budget() {
+        if std::fs::read_to_string("/proc/sys/fs/pipe-user-pages-soft").is_err() {
+            eprintln!("skipped: fs.pipe-user-pages-soft not readable here");
+            return;
+        }
+        let y = r#"
+listeners: []
+api:
+  bind: "127.0.0.1:9000"
+runtime:
+  splice_chunk: 262144
+  pipe_size: 262144
+"#;
+        let c: Config = serde_norway::from_str(y).expect("parse");
+        let d = validate(&c);
+        assert!(errors(&d).is_empty(), "a big pipe is a trade-off, not an error: {d:?}");
+        let msg = warnings(&d)
+            .iter()
+            .find(|x| x.path == "runtime.pipe_size")
+            .map(|x| x.message.clone())
+            .unwrap_or_default();
+        assert!(msg.contains("concurrent connections"), "budget warning missing: {d:?}");
+    }
+
+    /// The whole section is optional: a config written before it existed must
+    /// still validate, and the defaults must be clean.
+    #[test]
+    fn runtime_section_is_optional_and_defaults_are_clean() {
+        let y = r#"
+listeners: []
+api:
+  bind: "127.0.0.1:9000"
+"#;
+        let c: Config = serde_norway::from_str(y).expect("parse");
+        assert_eq!(c.runtime.io_uring_entries, 4096);
+        let d = validate(&c);
+        assert!(
+            !d.iter().any(|x| x.path.starts_with("runtime.")),
+            "defaults must not warn: {d:?}"
+        );
     }
 
     #[test]
