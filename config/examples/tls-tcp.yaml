@@ -1,0 +1,20 @@
+# DNS over TLS: the router handles TLS, the resolver handles raw TCP DNS.
+# Replace these placeholder paths with a certificate for dns.example.com.
+default_tls:
+  cert: /etc/sni-router/certs/fullchain.pem
+  key: /etc/sni-router/certs/privkey.pem
+
+listeners:
+  - name: dot
+    bind: ["0.0.0.0:853"]
+    proto: tcp
+    routes:
+      - sni: "dns.example.com"
+        backend: resolver
+
+backends:
+  resolver:
+    mode: terminate_tcp
+    servers: ["127.0.0.1:5353"]
+    # Enable only if the resolver's TCP listener expects a PROXY header.
+    # proxy_protocol: v2

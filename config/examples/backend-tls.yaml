@@ -1,0 +1,29 @@
+# Client TLS is terminated and HTTP/1.1 is re-encrypted to the backend.
+# Replace all three certificate paths and the backend IP before use.
+default_tls:
+  cert: /etc/sni-router/certs/fullchain.pem
+  key: /etc/sni-router/certs/privkey.pem
+
+listeners:
+  - name: https
+    bind: ["0.0.0.0:443"]
+    proto: tcp
+    routes:
+      - sni: "app.example.com"
+        backend: app
+
+backends:
+  app:
+    mode: terminate
+    servers: ["192.0.2.10:8443"]
+    backend_tls:
+      sni: origin.example.com
+      ca: /etc/sni-router/certs/backend-ca.pem
+      # For mTLS, supply both a client certificate and its matching key:
+      # client_cert: /etc/sni-router/certs/client.pem
+      # client_key: /etc/sni-router/certs/client-key.pem
+    headers:
+      x_real_ip: true
+      x_forwarded_for: true
+      x_forwarded_proto: true
+    # http2 stays false: the HTTP/2 gateway cannot use backend_tls.

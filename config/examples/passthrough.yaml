@@ -1,0 +1,32 @@
+# TCP TLS and QUIC on the same public port need separate listeners.
+# Replace the documentation addresses below with your backend IPs.
+# Backends must serve TLS/QUIC themselves; the router needs no certificate.
+listeners:
+  - name: tls
+    bind: ["0.0.0.0:443", "[::]:443"]
+    proto: tcp
+    routes:
+      - sni: "example.com"
+        backend: web_tcp
+      - sni: "*.example.com"
+        backend: web_tcp
+  - name: quic
+    bind: ["0.0.0.0:443", "[::]:443"]
+    proto: udp
+    routes:
+      - sni: "example.com"
+        backend: web_quic
+      - sni: "*.example.com"
+        backend: web_quic
+
+# No catch-all: unrelated names and traffic without SNI are rejected.
+backends:
+  web_tcp:
+    mode: passthrough
+    balance: round_robin
+    health_check: true
+    servers: ["192.0.2.10:443", "192.0.2.11:443"]
+  web_quic:
+    mode: passthrough
+    balance: round_robin
+    servers: ["192.0.2.10:443", "192.0.2.11:443"]

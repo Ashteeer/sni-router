@@ -1,0 +1,33 @@
+# Replace these placeholder paths with a certificate for app.example.com.
+default_tls:
+  cert: /etc/sni-router/certs/fullchain.pem
+  key: /etc/sni-router/certs/privkey.pem
+
+listeners:
+  - name: https
+    bind: ["0.0.0.0:443"]
+    proto: tcp
+    routes:
+      - sni: "app.example.com"
+        backend: app
+
+backends:
+  app:
+    mode: terminate
+    http2: true
+    balance: round_robin
+    # The backend serves plaintext HTTP/1.1, even when a client uses HTTP/2.
+    servers: ["127.0.0.1:8080"]
+    headers:
+      x_real_ip: true
+      x_forwarded_for: true
+      x_forwarded_proto: true
+    http_rules:
+      # Rules use path prefixes: /healthz and /healthz/... both match.
+      - path: /healthz
+        action: respond
+        status: 200
+        body: "ok\n"
+        content_type: text/plain
+      - path: "*"
+        action: forward

@@ -1,199 +1,154 @@
 # sni-router
 
-High-performance SNI-aware edge router for Linux.
+Route TLS connections by hostname without taking over their certificates.
 
-sni-router accepts TCP, UDP and QUIC connections and decides what to do with
-each one from the TLS SNI (Server Name Indication) — per backend, and without
-forcing a single behaviour on the whole port:
+sni-router is a Linux proxy for TCP, UDP and QUIC. It reads the server name
+from a TLS ClientHello, selects a backend from a YAML routing table, and
+forwards the connection. In passthrough mode, TLS stays between the client
+and the backend. Services with different hostnames can share one address
+and port.
 
-- **Passthrough** — route by SNI and forward the raw stream, TLS untouched, so
-  backends keep their own certificates. Zero-copy on the fast path.
-- **Terminate** — terminate TLS at the router and act as a reverse proxy:
-  HTTP/1.1 and HTTP/2, header injection (`X-Real-IP` / `X-Forwarded-*`),
-  WebSocket upgrades, optional re-encrypt/mTLS to the backend, and per-path
-  rules (forward, synthetic responses, redirects).
-- **Raw-TCP terminate** — strip TLS and hand the backend a plain TCP stream,
-  for DoT (`:853`) and other non-HTTP protocols behind TLS.
-- **Redirect** — answer plaintext HTTP on `:80` with a `301` to `https://`.
+For services that need TLS to end at the router, a backend can instead use
+HTTP termination or raw TCP termination. This is useful when an HTTPS app,
+a TLS tunnel and a DNS-over-TLS resolver sit behind the same machine but
+need different handling.
 
-One listener can mix all of these across different SNI names. The same tool
-therefore covers what usually takes `sniproxy`/`sslh` for passthrough *and* a
-separate HTTP reverse proxy for termination.
+[Installation](docs/installation.md) · [Configuration](docs/configuration.md) ·
+[Examples](config/examples/) · [Releases](https://github.com/Ashteeer/sni-router/releases)
 
-Design priorities, in order:
+## How it fits
 
-- **Raw performance** — io_uring (`monoio`, thread-per-core), zero-copy
-  `splice()` forwarding, `SO_REUSEPORT` sharding with CPU pinning, optional
-  TCP Fast Open on listeners.
-- **TCP _and_ UDP/QUIC** out of the box, not TCP only.
-- **A config a human can read** — flat YAML, sane defaults, first-match
-  routing. Closer to HAProxy than to Envoy, and simpler than both. See
-  [`config.md`](config.md) for the complete reference.
-
-## Status
-
-**v1.0.0** — feature-complete for the capabilities listed below, with unit
-tests and live integration tests on real traffic. It handles untrusted input
-(anonymous TLS/QUIC ClientHellos), so roll it out deliberately and validate
-your config with `sni-router -t` first.
-
-| Milestone | State |
-|---|---|
-| Config parsing + static validation (`sni-router -t`, like `nginx -t`) | done |
-| TCP passthrough with SNI extraction (robust to fragmented ClientHello) | done |
-| PROXY protocol v1/v2 (real client IP for backends) | done |
-| PROXY protocol over UDP — per-datagram for plain UDP (DNS), leading datagram for QUIC | done |
-| UDP/QUIC passthrough (SNI from the QUIC Initial packet) | done |
-| Backend pools: round-robin / least-conn | done |
-| TLS termination mode + `X-Forwarded-*` header injection | done |
-| Re-encrypt to TLS backends (`backend_tls`) + mTLS | done |
-| Access control (allow/deny by client IP CIDR and SNI) | done |
-| QUIC v2 (RFC 9369) Initial decryption | done |
-| Management + metrics API — one bind, one token (`/status`, `/config`, `/healthz`, `/metrics`, `/version`, `PUT`/`POST` writes) | done |
-| Self-update — `sni-router -u` / `POST /update` (fetch latest release, replace binary, restart) | done |
-| Zero-downtime cert reload (certbot/lego renewals) | done |
-| Backend health checks (TCP probe) + connect retry across the pool | done |
-| Zero-copy `splice()` TCP forwarding | done |
-| TCP Fast Open on listeners (`fast_open: true`) | done |
-| Tunable accept queues (`backlog`, `fast_open_qlen`) + TCP keepalive | done |
-| Pooled keep-alive backend connections for the HTTP/2 gateway | done |
-| TCP Fast Open to backends (`backends.*.fast_open`) | done |
-| Fuzzed protocol parsers (`cargo fuzz`, TLS + QUIC) | done |
-| WebSocket / HTTP Upgrade tunneling in terminate mode | done |
-| Hot reload on SIGHUP (validate first, keep old config on failure) | done |
-| Structured access logs + `tracing` (text/json) | done |
-| Rate limiting (`max_conns_per_ip`) | done |
-| Graceful drain on SIGTERM | done |
-| `:80`→`:443` redirect (`mode: redirect_https`) | done |
-| Raw-TCP terminate for DoT etc. (`mode: terminate_tcp`) | done |
-| Per-path rules + synthetic `direct_response` in terminate | done |
-| HTTP/2 termination (`h2` ALPN → HTTP/1.1 backend gateway) | done |
-
-**Resilience to DPI-bypass clients (Zapret / GoodbyeDPI / byedpi):** the SNI
-parser never assumes the ClientHello arrives in one piece — it reassembles
-across TCP segments and TLS records, and fake packets (bad checksum / TTL) are
-dropped by the kernel before they reach it. On QUIC, a fake Initial simply
-fails AEAD authentication and is ignored while the real one is awaited.
-
-## Quick start
-
-> Requires a published release; until the first one exists, build from source
-> (see below).
-
-```bash
-wget https://raw.githubusercontent.com/Ashteeer/sni-router/main/install.sh
-sudo bash install.sh
+```text
+                         sni-router                   backends
+                    ┌──────────────────┐
+ app.example.com ────┤                  ├── passthrough ── HTTPS server
+ api.example.com ────┤ :443 TCP, by SNI  ├── terminate ──── HTTP application
+ dns.example.com ────┤                  ├── terminate_tcp ─ DNS server
+                    └──────────────────┘
+ app.example.com ───── :443 UDP, QUIC SNI ── passthrough ── HTTP/3 server
 ```
 
-The installer detects your architecture (x86_64 / aarch64), downloads the
-latest release binary to `/usr/local/bin/sni-router`, puts a default config in
-`/etc/sni-router/sni-router.yaml` and registers a systemd unit — **without
-starting it**, so nothing touches ports until you say so:
+The listener defines where traffic arrives. The backend defines what happens
+to it. TCP routes on one listener can use different backend modes; UDP routes
+use passthrough only.
 
-```bash
-sudo nano /etc/sni-router/sni-router.yaml   # pick bind addresses that are free
-sni-router -t                               # validate (never binds anything)
-sudo systemctl enable --now sni-router
-```
+| Mode | Client side | Backend side | Certificates on the router |
+| --- | --- | --- | --- |
+| `passthrough` | TCP, or UDP including QUIC v1/v2 | Original stream or datagrams | No |
+| `terminate` | HTTPS: HTTP/1.1, optional HTTP/2 | HTTP/1.1, optionally TLS for HTTP/1.1 clients | Yes |
+| `terminate_tcp` | TLS carrying any TCP protocol | Plain TCP | Yes |
+| `redirect_https` | Plain HTTP | Local redirect or response; no upstream | No |
 
-Full server guide: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+TCP passthrough uses `splice(2)` with a buffered fallback. Workers run on
+monoio, one per available CPU, with `SO_REUSEPORT` listeners and CPU affinity.
+Other supported features include backend pools, TCP health probes, PROXY
+protocol, IP/SNI access lists, WebSocket upgrades, certificate reloads and a
+management API with Prometheus metrics.
 
-## Configuration
+## A small routing config
+
+This example sends two hostnames to separate TLS servers. The backends own
+their certificates; the router needs none. Replace the hostnames and upstream
+addresses with yours, and point both DNS names at the router.
 
 ```yaml
 listeners:
-  - name: main_tls
-    bind: ["0.0.0.0:443", "[::]:443"]
-    proto: tcp                    # tcp | udp (udp = QUIC)
-    fast_open: true               # accept TCP Fast Open (needs sysctl
-                                  # net.ipv4.tcp_fastopen=3)
-    # backlog: 1024               # listen() accept queue (default 1024)
-    routes:                       # first match wins
-      - sni: "example.com"
-        backend: web_main
-      - sni: "*.example.com"      # any subdomain, not example.com itself
-        backend: web_main
-      - sni: "*"                  # catch-all
-        backend: default_pool
+  - name: tls
+    bind: ["0.0.0.0:443"]
+    routes:
+      - sni: "app.example.com"
+        backend: app
+      - sni: "api.example.com"
+        backend: api
 
 backends:
-  web_main:
-    mode: passthrough             # passthrough | terminate | terminate_tcp | redirect_https
-    proxy_protocol: v2            # none | v1 | v2 — pass the real client IP
-    balance: round_robin          # round_robin | least_conn
-    servers:
-      - "10.0.0.1:443"
-      - "10.0.0.2:443"
-
-  default_pool:                   # minimal backend: everything defaulted
-    servers:
-      - "10.0.0.9:443"
-
-timeouts:                         # seconds
-  handshake: 5
-  connect: 10
-  idle: 300
+  app:
+    servers: ["127.0.0.1:8443"]
+  api:
+    servers: ["127.0.0.1:9443"]
 ```
 
-Annotated example: [config/sni-router.example.yaml](config/sni-router.example.yaml).
+`proto: tcp` and `mode: passthrough` are the defaults. Routes are checked in
+order; the first match wins. A connection without a matching name is closed.
+Add `sni: "*"` as the last route only if you want a fallback, including for
+clients without SNI. `*.example.com` matches subdomains at any depth, but
+does not match `example.com` itself.
 
-### Validation
-
-Static check of the whole file — collects **all** errors at once, with exact
-config paths and `cargo`-style "did you mean" suggestions:
+Validate a saved file without binding ports:
 
 ```bash
-sni-router -t                        # default path /etc/sni-router/sni-router.yaml
-sni-router -t /path/to/config.yaml   # explicit path
-sni-router -t --check-backends       # additionally TCP-probe every backend server
+sni-router -t ./sni-router.yaml
 ```
 
-Exit code is `0` when the config is valid (warnings allowed), non-zero
-otherwise — safe to use as a gate in deploy scripts:
+The [routing guide](docs/routing.md) explains fallback behavior, plaintext
+traffic, UDP flows and how to carry the client's address to a backend.
+
+## Install and run
+
+Release binaries are provided for Linux x86_64. See the
+[installation guide](docs/installation.md) for runtime requirements,
+checksum verification and building for other architectures.
 
 ```bash
-sni-router -t && sudo systemctl reload sni-router
+curl -fsSLo install.sh https://raw.githubusercontent.com/Ashteeer/sni-router/main/install.sh
+less install.sh
+sudo bash install.sh
 ```
 
-The config path can also be set via the `SNI_ROUTER_CONFIG` environment
-variable.
+**A fresh installation starts the service immediately.** It creates an
+API-only config, listens on `0.0.0.0` at a generated port, and prints a bearer
+token. Without `--cert` and `--key`, this API uses HTTP. Restrict access to
+that port before installation, or supply a certificate as described in the
+[installation guide](docs/installation.md#install-with-systemd).
 
-## Build from source
-
-Linux only (io_uring / `splice`). Requires stable Rust
-([rustup.rs](https://rustup.rs)).
+The config lives at `/etc/sni-router/sni-router.yaml`. Add your `listeners`
+and `backends` to that file, keeping the generated `api` section if you use
+remote management. Then validate and apply it:
 
 ```bash
-git clone https://github.com/Ashteeer/sni-router
-cd sni-router
-cargo build --release
-./target/release/sni-router --help
+sudo sni-router -t /etc/sni-router/sni-router.yaml && sudo systemctl reload sni-router
+journalctl -u sni-router -n 30 --no-pager
 ```
 
-## Fuzzing
+Invalid configurations are rejected. Route changes can be applied in place;
+changes such as listener addresses or TLS settings restart the process and
+disconnect clients. The [reload table](docs/operations.md) describes the
+difference. To run without systemd, use `sni-router -c ./sni-router.yaml`.
 
-The TLS and QUIC parsers read attacker-controlled bytes from anonymous clients,
-and the binary ships `panic = "abort"` — so a panic in a parser is a remote
-crash. They are fuzzed with [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
-(nightly only; the library target exists for this):
+## Documentation
 
-```bash
-cargo install cargo-fuzz
-rustup toolchain install nightly
+| Read this | To do this |
+| --- | --- |
+| [Installation](docs/installation.md) | Install a release, verify it, or build from source |
+| [Configuration reference](docs/configuration.md) | Look up every YAML field, default and restriction |
+| [Routing](docs/routing.md) | Choose modes, order routes and forward client addresses |
+| [Example configurations](config/examples/) | Start with passthrough, HTTPS, DoT, DNS or API-only setups |
+| [Operations](docs/operations.md) | Reload, update, renew certificates and diagnose failures |
+| [Management API](docs/api.md) | Read status, replace configs and integrate monitoring |
+| [Architecture](docs/architecture.md) | Understand workers, forwarding, reloads and current limits |
+| [Contributing](CONTRIBUTING.md) | Build, test and submit changes |
 
-cargo +nightly fuzz list                 # tls_sni, tls_fragmented, quic_initial
-cargo +nightly fuzz run tls_sni -- -max_total_time=60
-```
+## Scope and limitations
 
-| target | covers |
-|---|---|
-| `tls_sni` | ClientHello record framing + extension parsing |
-| `tls_fragmented` | the incremental path: a growing buffer fed chunk by chunk, as DPI-bypass clients produce |
-| `quic_initial` | Initial header protection, AEAD, CRYPTO frames, and the reassembler with attacker-chosen offsets |
+This is an actively developed proxy with a deliberately small configuration
+surface. It does not include a web UI or an ACME client; use an external
+certificate manager such as certbot or lego.
 
-A crash writes the input to `fuzz/artifacts/<target>/`; replay it with
-`cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.
+QUIC is forwarded, not terminated. Connection migration is unsupported, and
+encrypted ClientHello names cannot be used for routing. Ordinary UDP has no
+SNI and needs a catch-all route. Backend addresses must be literal IP addresses
+with ports; DNS names are not resolved.
+
+HTTP/2 termination is a gateway to plaintext HTTP/1.1 upstreams, without
+server push or trailers. The HTTP and UDP paths also have outstanding
+correctness and resource-limit issues described under
+[known limitations](docs/architecture.md#known-limitations). Check these
+before exposing a deployment to untrusted traffic.
+
+There are no published throughput benchmarks. The architecture is intended
+to keep forwarding overhead low; capacity depends on the workload, kernel,
+network and configuration.
 
 ## License
 
-Apache-2.0
+[Apache License 2.0](LICENSE).

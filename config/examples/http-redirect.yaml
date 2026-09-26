@@ -1,0 +1,22 @@
+# Plain HTTP has no TLS SNI. Host is read only after the catch-all route.
+listeners:
+  - name: http
+    bind: ["0.0.0.0:80", "[::]:80"]
+    proto: tcp
+    routes:
+      - sni: "*"
+        backend: redirect
+
+backends:
+  redirect:
+    mode: redirect_https
+    # No servers or TLS certificate needed: every response is local.
+    http_rules:
+      - path: /healthz
+        action: respond
+        status: 200
+        body: "ok\n"
+      - path: "*"
+        action: redirect
+        status: 301
+        to: https

@@ -1,0 +1,30 @@
+# Plain DNS has no TLS SNI, so both transports use the catch-all route.
+# Keep access restricted to the networks you intend to serve.
+listeners:
+  - name: dns_tcp
+    bind: ["0.0.0.0:53"]
+    proto: tcp
+    acl:
+      allow_ip: ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    routes:
+      - sni: "*"
+        backend: resolver
+  - name: dns_udp
+    bind: ["0.0.0.0:53"]
+    proto: udp
+    acl:
+      allow_ip: ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    routes:
+      - sni: "*"
+        backend: resolver
+
+backends:
+  resolver:
+    mode: passthrough
+    servers: ["127.0.0.1:5353"]
+    # The resolver must listen on both TCP and UDP at this address.
+    # Default: no PROXY header. For a dedicated PROXY-aware resolver,
+    # set proxy_protocol: v2 here and use its PROXY-capable port.
+
+timeouts:
+  udp_idle: 30

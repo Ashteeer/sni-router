@@ -1,202 +1,79 @@
-# sni-router example configuration.
-# Copy to /etc/sni-router/sni-router.yaml and adjust.
-# Validate any time (never binds ports, safe next to a live instance):
-#   sni-router -t
+# TCP TLS passthrough with explicit defaults.
+# Replace the example names and upstream addresses before running.
+# Reference: docs/configuration.md. More scenarios: config/examples/.
+# Validate without binding ports: sni-router -t /path/to/this-file.yaml
 
 listeners:
-  - name: main_tls
-    bind:                       # one listener can accept on several addresses
-      - "0.0.0.0:443"
-      - "[::]:443"
-    proto: tcp                  # tcp | udp (udp = QUIC passthrough)
-    # fast_open: true           # accept TCP Fast Open (tcp only): returning
-                                # clients send the ClientHello in the SYN, saving
-                                # an RTT. Needs sysctl net.ipv4.tcp_fastopen=3.
-    # backlog: 1024             # listen() accept queue. Raise only if
-                                # "nstat -az TcpExtListenOverflows" is climbing.
-    # fast_open_qlen: 1024      # pending TFO SYNs; needs fast_open. Raise only if
-                                # TcpExtTCPFastOpenListenOverflow is climbing.
-    # Optional access control (deny wins; an empty allow list means "any").
-    # acl:
-    #   allow_ip: ["10.0.0.0/8", "192.168.1.5"]
-    #   deny_ip:  ["10.0.0.66"]
-    #   allow_sni: ["*.example.com"]
-    #   deny_sni:  ["blocked.example.com"]
-    routes:                     # first match wins
+  - name: tls
+    bind: ["0.0.0.0:443", "[::]:443"]
+    proto: tcp
+    backlog: 1024
+    fast_open: false
+    # fast_open_qlen: 1024      # TCP Fast Open pending queue, if enabled
+    routes:                   # first match wins
       - sni: "example.com"
-        backend: web_main
-      - sni: "*.example.com"    # any subdomain depth, NOT example.com itself
-        backend: web_main
-      - sni: "*"                # catch-all (also catches clients without SNI)
-        backend: default_pool
-
-  # Plain HTTP on :80 that 301-redirects everything to https:// (Envoy parity).
-  # - name: http_redirect
-  #   bind: ["0.0.0.0:80", "[::]:80"]
-  #   proto: tcp
-  #   routes:
-  #     - sni: "*"
-  #       backend: to_https
-
-  # DNS-over-TLS on :853: terminate TLS, hand the backend raw TCP DNS.
-  # - name: dot
-  #   bind: ["0.0.0.0:853"]
-  #   proto: tcp
-  #   routes:
-  #     - sni: "*"
-  #       backend: dot_backend
+        backend: web
+      - sni: "*.example.com"   # any subdomain depth; excludes the apex
+        backend: web
+      # No catch-all: unrecognised names and non-TLS connections are rejected.
+      # Add a final sni: "*" route only when a fallback is intended.
+    # acl:
+    #   allow_ip: ["192.0.2.0/24", "2001:db8::/32"]
+    #   deny_ip: ["192.0.2.10"]
+    #   allow_sni: ["example.com", "*.example.com"]
+    #   deny_sni: ["blocked.example.com"]
 
 backends:
-  web_main:
-    mode: passthrough           # passthrough | terminate — what THIS backend expects
-    proxy_protocol: v2          # none | v1 | v2 — how to pass the real client IP
-    balance: round_robin        # round_robin | least_conn
-    health_check: true          # per-backend TCP connect probe (default: false).
-                                # On failure a server is skipped; connects always
-                                # retry the next server in the pool regardless.
-    # fast_open: true           # TCP Fast Open when connecting to servers.
-                                # Only pays off for a REMOTE server that has TFO
-                                # enabled itself; pointless for 127.0.0.1.
-    servers:
-      - "10.0.0.1:443"
-      - "10.0.0.2:443"
+  web:
+    mode: passthrough
+    proxy_protocol: none       # enable v1/v2 only if the upstream expects it
+    balance: round_robin
+    health_check: true         # TCP connect probes, not application checks
+    fast_open: false
+    servers: ["127.0.0.1:8443", "127.0.0.1:9443"]
 
-  default_pool:                 # minimal backend: everything defaulted
-    servers:
-      - "10.0.0.9:443"
-
-  # TLS termination example (mode: terminate — TCP/HTTP only):
-  # api_terminate:
-  #   mode: terminate
-  #   tls:                              # cert the router presents to clients
-  #     cert: "/etc/sni-router/certs/api.example.org.pem"
-  #     key: "/etc/sni-router/certs/api.example.org.key"
-  #   backend_tls:                      # optional: re-encrypt to the backend
-  #     sni: "api.internal"             #   name to send/verify (default: client SNI)
-  #     ca: "/etc/sni-router/certs/backend-ca.pem"   # trust this CA (default: system roots)
-  #     # insecure_skip_verify: true    #   skip verification (test only)
-  #     # client_cert: "/etc/.../client.pem"   # mTLS to the backend
-  #     # client_key:  "/etc/.../client.key"
-  #   http2: true                       # advertise & terminate h2 (gatewayed to
-  #                                     #   the backend over HTTP/1.1; not with backend_tls)
-  #   headers:
-  #     x_real_ip: true
-  #     x_forwarded_for: true
-  #     x_forwarded_proto: true
-  #   balance: least_conn
-  #   servers:
-  #     - "10.0.1.5:8080"
-  #   # Optional per-path rules (first match wins; no rules = forward everything).
-  #   # action: forward | respond | redirect. The SAME rules work on a
-  #   # redirect_https (plaintext) backend too — synthetic 404/301 anywhere.
-  #   http_rules:
-  #     - path: "/dns-query"          # forward this path to the servers above
-  #       action: forward
-  #     - path: "/old"                # 301/302/... to another URL
-  #       action: redirect
-  #       to: "https://example.com/new"
-  #       status: 301                 # optional, default 301
-  #     - path: "*"                   # answer everything else directly
-  #       action: respond
-  #       status: 404
-  #       body: "not found\n"
-  #       content_type: "text/plain"
-
-  # Plaintext responder on :80. With no http_rules it 301-redirects everything
-  # to https (the common one-liner). Add http_rules for custom 404/301 on :80.
-  # to_https:
-  #   mode: redirect_https
-  #   # http_rules:                    # optional; e.g. serve /health, redirect the rest
-  #   #   - { path: "/health", action: respond, status: 200, body: "ok\n" }
-  #   #   - { path: "*", action: redirect, to: "https" }   # "https" = same host+path over https
-
-  # DoT / raw-TCP terminate: strip TLS, forward raw bytes to a DNS-over-TCP
-  # server. Optional proxy_protocol passes the real client IP.
-  # dot_backend:
-  #   mode: terminate_tcp
-  #   proxy_protocol: none
-  #   tls:
-  #     cert: "/etc/sni-router/certs/dns.example.org.pem"
-  #     key: "/etc/sni-router/certs/dns.example.org.key"
-  #   servers:
-  #     - "10.0.2.5:53"
-
-# Shared certificate for terminate backends. Any backend using mode: terminate
-# or terminate_tcp that does NOT set its own `tls:` falls back to this one — handy
-# when many backends share a single wildcard cert. A backend's own `tls:` wins.
-# default_tls:
-#   cert: "/etc/sni-router/certs/wildcard.pem"
-#   key: "/etc/sni-router/certs/wildcard.key"
-
-# Global timeouts, seconds (defaults shown).
+# Seconds. These are the defaults, not a single end-to-end request deadline.
 timeouts:
-  handshake: 5                  # max time to read ClientHello (slowloris protection)
-  connect: 10                   # backend connect timeout
-  idle: 300                     # idle timeout: QUIC flows + terminate reads
-  udp_idle: 30                  # idle timeout for plain-UDP flows (DNS etc).
-                                # Separate from `idle` because every flow costs a
-                                # backend socket and resolvers use a new source
-                                # port per query. QUIC never uses this value.
-  keepalive: 60                 # TCP keepalive idle time, both legs (0 = off).
-                                # Reaps peers that vanished without a FIN/RST —
-                                # the splice path has no idle timeout of its own.
-  health_interval: 10           # how often to run health-check probes
-  drain: 30                     # on SIGTERM, how long to wait for active conns
+  handshake: 5                 # each read while collecting TCP ClientHello
+  connect: 10                  # each backend connect attempt
+  idle: 300                    # HTTP/1.1 reads, TLS/h2 handshakes, QUIC expiry
+  udp_idle: 30                 # plain-UDP flow expiry; not used by QUIC
+  keepalive: 60                # TCP keepalive idle time; 0 disables it
+  health_interval: 10
+  drain: 30                    # shutdown wait for active TCP connections
 
-# Resource limits.
 limits:
-  max_client_hello: 16384       # max bytes buffered while reassembling ClientHello
-  max_conns_per_ip: 0           # max concurrent TCP connections per client IP (0 = off)
+  max_client_hello: 16384       # bytes, TCP ClientHello buffer
+  max_conns_per_ip: 0           # concurrent TCP connections; 0 means unlimited
 
-# Data-path tuning (all optional; defaults shown). None of these can delay a
-# byte: the forwarder never waits for a buffer to fill, it moves whatever has
-# arrived, down to a single byte. They only decide how much work one crossing
-# into the kernel does. Changing any of them fast-restarts the process.
+# Optional data-path settings. Changing them restarts the process on reload.
 runtime:
-  io_uring_entries: 4096        # io_uring queue depth per core (completion queue
-                                # is 2x this). Every live connection direction
-                                # parks one operation here. Rounded up to a power
-                                # of two by the kernel; max 32768.
-  splice_chunk: 65536           # ceiling on one splice move, bytes. Bulk traffic
-                                # costs 1 MiB / splice_chunk round trips per
-                                # direction, so this is throughput, not latency.
-  pipe_size: 65536              # staging pipe splice moves through (0 = kernel
-                                # default). Must be >= splice_chunk to be worth
-                                # raising. Capped by fs.pipe-max-size. NOTE: two
-                                # pipes per connection are charged to the per-user
-                                # budget fs.pipe-user-pages-soft (64 MiB), so this
-                                # size divides how many connections fit:
-                                # 64 KiB ~ 512 conns, 256 KiB ~ 128. `-t` warns
-                                # with the computed number.
-  splice_spin: 8                # forwarding rounds one connection may run before
-                                # yielding the core. Lower = fairer with many
-                                # connections, higher = fewer scheduler hops on
-                                # a few fat ones. 0 behaves like 1.
+  io_uring_entries: 4096        # submission queue entries per worker
+  splice_chunk: 65536           # bytes per move; never waits for a full chunk
+  pipe_size: 65536              # requested bytes per pipe; 0 uses kernel default
+  splice_spin: 8                # rounds before yielding to other tasks
 
-# Logging.
+# Each TCP passthrough connection uses two pipes. Their pages share the
+# service user's fs.pipe-user-pages-soft budget. Check validation warnings
+# before increasing pipe_size; see docs/configuration.md for the calculation.
+
 log:
-  level: info                   # error | warn | info | debug | trace (RUST_LOG overrides)
-  format: text                  # text | json (json = one object per line, for log shippers)
+  level: info
+  format: text
 
-# Management + metrics API (optional) — one bind, one token, control plane for a
-# web UI. When `token` is set, EVERY endpoint requires `Authorization: Bearer`.
-#   reads : GET  /status  /config  /healthz  /metrics   (Prometheus text)
-#   writes: PUT  /config   (validate + replace file + apply)
-#           POST /reload    (re-read config from disk)
-#           POST /restart   (re-exec the process now)
-# The installer generates `bind` (0.0.0.0:<random free port>) and `token`
-# automatically. Set `tls` (or default_tls) to serve it over HTTPS.
+# Optional management and metrics API. Use a unique token, not this placeholder.
+# Read and write requests require the token; GET /config omits it.
+# Without api.tls or default_tls this uses HTTP, so keep it on a trusted network.
 # api:
-#   bind: "0.0.0.0:9000"
-#   token: "change-me"          # Bearer token; guards every endpoint, redacted in /config
-#   # tls:                       # serve the API over HTTPS (else default_tls, else plaintext)
-#   #   cert: "/etc/sni-router/certs/api.pem"
-#   #   key:  "/etc/sni-router/certs/api.key"
+#   bind: "127.0.0.1:9000"
+#   token: "replace-with-a-random-token"
 
-# Reload without a restart: `kill -HUP <pid>` (or `systemctl reload sni-router`)
-# re-reads this file, validates it, and applies route/backend/timeout/acl changes
-# to new connections. Invalid configs are rejected and the running one keeps
-# serving. Changing listener bind addresses still requires a restart.
+# Termination examples with certificate settings are separate, complete files:
+# config/examples/https-termination.yaml
+# config/examples/tls-tcp.yaml
+# config/examples/backend-tls.yaml
 #
-# Graceful shutdown: `kill -TERM <pid>` stops accepting new connections and waits
-# up to `timeouts.drain` seconds for active ones to finish before exiting.
+# After editing a running installation:
+#   sudo sni-router -t && sudo systemctl reload sni-router
+# Route-only edits hot-swap. Listener/runtime/TLS-setting edits may re-exec
+# the process and disconnect clients. See docs/operations.md before applying.

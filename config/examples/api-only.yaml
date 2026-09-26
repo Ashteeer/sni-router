@@ -1,0 +1,10 @@
+# Bootstrap management without any data listeners.
+# Replace the token before use; generate one with: openssl rand -hex 32
+# Loopback only. Use an SSH tunnel, or configure TLS before remote access.
+api:
+  bind: "127.0.0.1:9000"
+  token: "replace-with-a-generated-token"
+
+log:
+  level: info
+  format: text
