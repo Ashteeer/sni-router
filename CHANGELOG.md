@@ -2,6 +2,10 @@
 
 ## 1.9.2 (unreleased)
 
+- Keep management available after self-update/restart when io_uring allocation
+  fails. Workers retry temporary resource errors for up to two seconds, then
+  fall back to epoll instead of silently disappearing. If both drivers fail,
+  exit with an error so a service manager can recover the process.
 - Prevent TCP passthrough from saturating a CPU when socket readiness keeps
   waking a transfer that still returns `EAGAIN`. Repeated wakeups without
   progress now use a bounded asynchronous backoff of 1–16 ms; successful
@@ -10,6 +14,9 @@
   bytes, TCP half-close behavior and the existing configuration schema.
 - Add an isolated Linux regression test that injects false write readiness,
   checks bounded retries and verifies data in both directions.
+- Test startup and three API re-execs with a child-only locked-memory limit,
+  verifying that the API and every configured worker remain available. Skip
+  the bulk TCP unit test on WSL1, whose readiness handling can stall the baseline.
 
 ## [1.9.1](https://github.com/Ashteeer/sni-router/releases/tag/v1.9.1)
 

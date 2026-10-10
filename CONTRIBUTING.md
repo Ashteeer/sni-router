@@ -66,12 +66,18 @@ isolated child process on ephemeral loopback ports:
 
 ```sh
 python3 tests/forwarder-backpressure/check.py ./target/release/sni-router
+python3 tests/runtime-startup/check.py ./target/release/sni-router
 ```
 
 It injects temporary `EAGAIN` results while sockets remain writable, checks
 that retries stay bounded, and verifies byte integrity and TCP half-closes
 for both splice and the copy fallback. It skips unsupported hosts, including
 WSL1. The preload library is applied only to the test child.
+
+The runtime startup test limits locked memory only in its child process to
+exercise io_uring allocation failures. It verifies the management API and all
+workers after startup and three API restarts, both with and without the limit.
+When run as root, the child runs as `nobody`; live service settings are untouched.
 
 There is no GitHub Actions build/test workflow in this repository. Include
 the commands you ran and their results in the pull request, along with any
