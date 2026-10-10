@@ -61,6 +61,18 @@ external fixture should detect its availability and skip with a reason when
 it is absent. For manual networking tests, use an isolated configuration and
 free ports; clean up the test process, keys and temporary files afterwards.
 
+The forwarding backpressure regression uses Python 3, a C compiler and an
+isolated child process on ephemeral loopback ports:
+
+```sh
+python3 tests/forwarder-backpressure/check.py ./target/release/sni-router
+```
+
+It injects temporary `EAGAIN` results while sockets remain writable, checks
+that retries stay bounded, and verifies byte integrity and TCP half-closes
+for both splice and the copy fallback. It skips unsupported hosts, including
+WSL1. The preload library is applied only to the test child.
+
 There is no GitHub Actions build/test workflow in this repository. Include
 the commands you ran and their results in the pull request, along with any
 checks you could not run.

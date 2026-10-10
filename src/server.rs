@@ -1078,6 +1078,28 @@ fn interrupted(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::Interrupted
 }
 
+/// Readiness is only a hint: a socket can keep reporting writable while a
+/// non-blocking splice still returns EAGAIN. Yielding alone would reschedule
+/// the same hot loop. Back off only after a readiness wake made no progress;
+/// ordinary EAGAIN waits and successful transfers pay no timer cost.
+#[derive(Default)]
+struct ReadinessBackoff {
+    delay_ms: u64,
+}
+
+impl ReadinessBackoff {
+    async fn stalled(&mut self) {
+        if self.delay_ms != 0 {
+            monoio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        }
+        self.delay_ms = (self.delay_ms * 2).clamp(1, 16);
+    }
+
+    fn progress(&mut self) {
+        self.delay_ms = 0;
+    }
+}
+
 /// Hand the core back for one turn.
 ///
 /// monoio has no `yield_now`, and the forwarder below drives its own syscalls:
@@ -1133,14 +1155,19 @@ async fn splice_dir(src: Rc<TcpStream>, dst: Rc<TcpStream>, cfg: SpliceCfg) -> u
     };
     let mut total = 0u64;
     let mut spun = 0u32;
+    let mut backoff = ReadinessBackoff::default();
     'copy: loop {
         // --- source socket -> pipe ---
         let n = loop {
             match splice_raw(sfd, pipe.w, cfg.chunk) {
                 Ok(0) => break 'copy, // peer closed its write side
-                Ok(n) => break n,
+                Ok(n) => {
+                    backoff.progress();
+                    break n;
+                }
                 Err(ref e) if would_block(e) => {
                     spun = 0;
+                    backoff.stalled().await;
                     if src.readable(false).await.is_err() {
                         break 'copy;
                     }
@@ -1161,9 +1188,13 @@ async fn splice_dir(src: Rc<TcpStream>, dst: Rc<TcpStream>, cfg: SpliceCfg) -> u
                 // Cannot happen with a non-empty pipe, but returning 0 forever
                 // would spin the core, so treat it as a dead destination.
                 Ok(0) => break 'copy,
-                Ok(w) => left -= w,
+                Ok(w) => {
+                    backoff.progress();
+                    left -= w;
+                }
                 Err(ref e) if would_block(e) => {
                     spun = 0;
+                    backoff.stalled().await;
                     if dst.writable(false).await.is_err() {
                         break 'copy;
                     }
@@ -1190,13 +1221,18 @@ async fn copy_dir(src: Rc<TcpStream>, dst: Rc<TcpStream>, cfg: SpliceCfg) -> u64
     let mut buf = vec![0u8; cfg.chunk];
     let mut total = 0u64;
     let mut spun = 0u32;
+    let mut backoff = ReadinessBackoff::default();
     'copy: loop {
         let n = loop {
             match read_raw(sfd, &mut buf) {
                 Ok(0) => break 'copy,
-                Ok(n) => break n,
+                Ok(n) => {
+                    backoff.progress();
+                    break n;
+                }
                 Err(ref e) if would_block(e) => {
                     spun = 0;
+                    backoff.stalled().await;
                     if src.readable(false).await.is_err() {
                         break 'copy;
                     }
@@ -1210,9 +1246,13 @@ async fn copy_dir(src: Rc<TcpStream>, dst: Rc<TcpStream>, cfg: SpliceCfg) -> u64
         while off < n {
             match write_raw(dfd, &buf[off..n]) {
                 Ok(0) => break 'copy,
-                Ok(w) => off += w,
+                Ok(w) => {
+                    backoff.progress();
+                    off += w;
+                }
                 Err(ref e) if would_block(e) => {
                     spun = 0;
+                    backoff.stalled().await;
                     if dst.writable(false).await.is_err() {
                         break 'copy;
                     }

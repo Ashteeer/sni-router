@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.9.2 (unreleased)
+
+- Prevent TCP passthrough from saturating a CPU when socket readiness keeps
+  waking a transfer that still returns `EAGAIN`. Repeated wakeups without
+  progress now use a bounded asynchronous backoff of 1–16 ms; successful
+  transfers reset it and the normal forwarding path has no added timer.
+- Apply the same protection to the userspace copy fallback. Preserve buffered
+  bytes, TCP half-close behavior and the existing configuration schema.
+- Add an isolated Linux regression test that injects false write readiness,
+  checks bounded retries and verifies data in both directions.
+
 ## [1.9.1](https://github.com/Ashteeer/sni-router/releases/tag/v1.9.1)
 
 This release reorganizes the project documentation. Routing behavior and the
