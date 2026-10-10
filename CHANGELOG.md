@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.9.2 (unreleased)
+## [1.9.2](https://github.com/Ashteeer/sni-router/releases/tag/v1.9.2)
 
 - Keep management available after self-update/restart when io_uring allocation
   fails. Workers retry temporary resource errors for up to two seconds, then
