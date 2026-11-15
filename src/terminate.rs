@@ -1310,11 +1310,7 @@ where
         Ok(r) => r.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {e}")))?,
         Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "h2 handshake timeout")),
     };
-    while let Some(result) = conn.accept().await {
-        let (request, respond) = match result {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    while let Some((request, respond)) = next_h2_stream(conn.accept().await)? {
         let dialer = dialer.clone();
         let rules = rules.clone();
         let stats = stats.clone();
@@ -1327,6 +1323,14 @@ where
         });
     }
     Ok(())
+}
+
+/// A connection-level h2 error is terminal for this transport. In particular,
+/// monoio-http may leave buffered TLS output after a socket write returns
+/// `EPIPE`; polling the same connection again immediately resubmits that output
+/// and can pin the worker in an io_uring completion loop.
+fn next_h2_stream<T>(accepted: Option<Result<T, monoio_http::h2::Error>>) -> io::Result<Option<T>> {
+    accepted.transpose().map_err(h2_io)
 }
 
 /// Request-body framing chosen when forwarding to the HTTP/1.1 backend.
@@ -1842,6 +1846,84 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use monoio::buf::{IoBufMut, IoVecBuf, IoVecBufMut};
+    use monoio::BufResult;
+    use std::cell::Cell;
+
+    /// Minimal HTTP/2 transport: the server handshake is allowed to flush its
+    /// SETTINGS frame, then every write reports a permanent broken pipe. Keeping
+    /// the failure synchronous makes an accidental accept-loop retry deterministic
+    /// instead of depending on scheduler speed or a real TCP reset race.
+    struct BrokenAfterHandshake {
+        input: Vec<u8>,
+        offset: usize,
+        handshake_flushed: bool,
+        failures: Rc<Cell<u32>>,
+    }
+
+    impl BrokenAfterHandshake {
+        fn failed(&self) -> io::Error {
+            self.failures.set(self.failures.get() + 1);
+            io::ErrorKind::BrokenPipe.into()
+        }
+    }
+
+    impl AsyncReadRent for BrokenAfterHandshake {
+        async fn read<T: IoBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
+            let available = &self.input[self.offset..];
+            let n = available.len().min(buf.bytes_total());
+            unsafe {
+                buf.write_ptr()
+                    .copy_from_nonoverlapping(available.as_ptr(), n);
+                buf.set_init(n);
+            }
+            self.offset += n;
+            (Ok(n), buf)
+        }
+
+        async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
+            (Err(io::ErrorKind::Unsupported.into()), buf)
+        }
+    }
+
+    impl AsyncWriteRent for BrokenAfterHandshake {
+        async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+            if self.handshake_flushed {
+                return (Err(self.failed()), buf);
+            }
+            (Ok(buf.bytes_init()), buf)
+        }
+
+        async fn writev<T: IoVecBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+            if self.handshake_flushed {
+                return (Err(self.failed()), buf);
+            }
+            (Err(io::ErrorKind::Unsupported.into()), buf)
+        }
+
+        async fn flush(&mut self) -> io::Result<()> {
+            if self.handshake_flushed {
+                return Err(self.failed());
+            }
+            self.handshake_flushed = true;
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Err(self.failed())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct NeverDial;
+
+    impl BackendDial for NeverDial {
+        async fn dial(&self) -> io::Result<(TcpStream, bool)> {
+            Err(io::Error::other("test dialer must stay unused"))
+        }
+
+        fn release(&self, _s: TcpStream) {}
+    }
 
     fn rule(path: &str, action: HttpAction, status: Option<u16>) -> HttpRule {
         HttpRule { path: path.into(), action, status, body: String::new(), content_type: None, to: None }
@@ -1858,6 +1940,51 @@ mod tests {
         assert!(replayable("GET", false, false), "idempotent replays either way");
         assert!(!replayable("GET", true, true), "a forwarded body cannot be replayed");
         assert!(!replayable("POST", true, true));
+    }
+
+    /// A dead h2 transport must leave the accept loop on its first error. The
+    /// old `continue` polled the same connection again, repeatedly submitting
+    /// the buffered TLS write and receiving `EPIPE` without ever parking.
+    #[test]
+    fn h2_connection_error_is_terminal() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_timer()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let mut input = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+            // Empty client SETTINGS frame: length=0, type=4, stream=0.
+            input.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+            let failures = Rc::new(Cell::new(0));
+            let transport = BrokenAfterHandshake {
+                input,
+                offset: 0,
+                handshake_flushed: false,
+                failures: failures.clone(),
+            };
+            let gateway = h2_gateway(
+                transport,
+                NeverDial,
+                Headers::default(),
+                Arc::new(Vec::new()),
+                "127.0.0.1:1".parse().unwrap(),
+                Duration::from_secs(1),
+                Rc::new(Stats::default()),
+            );
+            match monoio::time::timeout(Duration::from_millis(100), gateway).await {
+                Ok(Err(_)) => {}
+                Ok(Ok(())) => panic!("gateway hid the broken transport"),
+                Err(_) => panic!(
+                    "gateway retried a terminal h2 error ({} failed writes)",
+                    failures.get()
+                ),
+            }
+            assert_eq!(
+                failures.get(),
+                1,
+                "a connection error must not be polled again"
+            );
+        });
     }
 
     /// `Content-Length: 0` used to count as "has a body", which alone disabled

@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.9.3](https://github.com/Ashteeer/sni-router/releases/tag/v1.9.3)
+
+- Stop an HTTP/2 terminated connection on its first connection-level I/O
+  error. Previously, a disconnect while TLS output was queued could make one
+  worker repeatedly submit the same send to a closed socket and receive
+  `EPIPE`, saturating one CPU core indefinitely.
+- Keep the failure scoped to the affected connection; other connections and
+  workers continue normally. Add a regression test that makes h2 accept errors
+  terminal instead of polling the failed connection again.
+
 ## [1.9.2](https://github.com/Ashteeer/sni-router/releases/tag/v1.9.2)
 
 - Keep management available after self-update/restart when io_uring allocation
